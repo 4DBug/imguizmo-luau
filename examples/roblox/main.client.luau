@@ -40,9 +40,9 @@ local function EditTransform(Matrix)
 
 	local Tr, Rt, Sc = {}, {}, {}
 	ImGuizmo.DecomposeMatrixToComponents(Matrix, Tr, Rt, Sc)
-	local Edited = ImGui.InputFloat3("Tr", Tr)
-	Edited = ImGui.InputFloat3("Rt", Rt) or Edited
-	Edited = ImGui.InputFloat3("Sc", Sc) or Edited
+	local Edited = ImGui.DragFloat3("Tr", Tr, 0.1)
+	Edited = ImGui.DragFloat3("Rt", Rt, 1) or Edited
+	Edited = ImGui.DragFloat3("Sc", Sc, 0.01) or Edited
 	if Edited then ImGuizmo.RecomposeMatrixFromComponents(Tr, Rt, Sc, Matrix) end
 
 	if Operation ~= OP.SCALE then
@@ -54,11 +54,11 @@ local function EditTransform(Matrix)
 	_, UseSnap = ImGui.Checkbox("Snap", UseSnap)
 	ImGui.SameLine()
 	if Operation == OP.ROTATE then
-		_, AngleSnap = ImGui.InputFloat("Angle Snap", AngleSnap)
+		AngleSnap = ImGui.DragFloat("Angle Snap", AngleSnap, 1)
 	elseif Operation == OP.SCALE then
-		_, ScaleSnap = ImGui.InputFloat("Scale Snap", ScaleSnap)
+		ScaleSnap = ImGui.DragFloat("Scale Snap", ScaleSnap, 0.01)
 	else
-		ImGui.InputFloat3("Snap Value", Snap)
+		ImGui.DragFloat3("Snap Value", Snap, 0.1)
 	end
 
 	_, BoundSizing = ImGui.Checkbox("Bound Sizing", BoundSizing)
@@ -66,7 +66,7 @@ local function EditTransform(Matrix)
 		ImGui.PushID(3)
 		_, BoundSizingSnap = ImGui.Checkbox("Bound Snap", BoundSizingSnap)
 		ImGui.SameLine()
-		ImGui.InputFloat3("Snap", BoundsSnap)
+		ImGui.DragFloat3("Snap", BoundsSnap, 0.01)
 		ImGui.PopID()
 	end
 	_, ShowGrid = ImGui.Checkbox("Show Grid", ShowGrid)
