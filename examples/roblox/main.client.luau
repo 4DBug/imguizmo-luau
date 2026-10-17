@@ -26,14 +26,14 @@ RunService.RenderStepped:Connect(function()
 	ImGuizmo.BeginFrame()
 
 	ImGui.Begin("Gizmo")
-	if ImGui.RadioButton("Translate", Operation == OP.TRANSLATE) then Operation = OP.TRANSLATE end
+	_, Operation = ImGui.RadioButton("Translate", Operation, OP.TRANSLATE)
 	ImGui.SameLine()
-	if ImGui.RadioButton("Rotate", Operation == OP.ROTATE) then Operation = OP.ROTATE end
+	_, Operation = ImGui.RadioButton("Rotate", Operation, OP.ROTATE)
 	ImGui.SameLine()
-	if ImGui.RadioButton("Scale", Operation == OP.SCALE) then Operation = OP.SCALE end
-	if ImGui.RadioButton("Local", Mode == MODE.LOCAL) then Mode = MODE.LOCAL end
+	_, Operation = ImGui.RadioButton("Scale", Operation, OP.SCALE)
+	_, Mode = ImGui.RadioButton("Local", Mode, MODE.LOCAL)
 	ImGui.SameLine()
-	if ImGui.RadioButton("World", Mode == MODE.WORLD) then Mode = MODE.WORLD end
+	_, Mode = ImGui.RadioButton("World", Mode, MODE.WORLD)
 	ImGui.End()
 
 	local Viewport = Camera.ViewportSize
