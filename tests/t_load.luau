@@ -1,0 +1,5 @@
+local RS = game:GetService("ReplicatedStorage")
+local G = require(RS:WaitForChild("ImGui"))
+local ImGuizmo = require(RS:WaitForChild("ImGuizmo"))(G)
+assert(type(ImGuizmo) == "table", "module did not return a table")
+print("OK")

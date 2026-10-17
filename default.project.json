@@ -1,0 +1,11 @@
+{
+	"name": "imguizmo-luau",
+	"tree": {
+		"$className": "DataModel",
+		"ReplicatedStorage": {
+			"ImGui": { "$path": "tools/core/build/ImGuiTyped.luau", "Impl": { "$path": "tools/core/build/ImGui.luau" } },
+			"ImGuizmo": { "$path": "ImGuizmo.lua" }
+		},
+		"StarterPlayer": { "StarterPlayerScripts": { "ImGuizmoExample": { "$path": "examples/roblox/main.client.luau" } } }
+	}
+}

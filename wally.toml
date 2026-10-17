@@ -1,0 +1,11 @@
+[package]
+name = "4dbug/imguizmo-luau"
+version = "0.1.0"
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+license = "MIT"
+description = "3D gizmo (translate/rotate/scale) for imgui-luau, with Roblox Camera/CFrame helpers."
+include = ["ImGuizmo.lua", "LICENSE", "README.md", "wally.toml", "default.project.json"]
+
+[peer-dependencies]
+ImGui = "4dbug/imgui-luau@^0.4.0"
