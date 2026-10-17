@@ -585,7 +585,6 @@ return function(G)
         end
     end
 
-    -- [Port] ViewManipulateState / mViewManipulateStates not ported yet (ViewManipulate is TODO)
     local gContext = {
         mDrawList = nil,
         mStyle = Style(),
@@ -682,6 +681,9 @@ return function(G)
         mIDStack = {}, -- [Port] plain 1-based array of ImGuiID
         mEditingID = -1,
         mOperation = 0,
+
+        -- per-id ViewManipulate widget states (see ViewManipulateState)
+        mViewManipulateStates = {}, -- [Port] map id -> state instead of ImVector + linear search
 
         mAllowAxisFlip = true,
         mGizmoSizeClipSpace = 0.1,
@@ -2411,6 +2413,549 @@ return function(G)
 
     function ImGuizmo.SetGizmoSizeClipSpace(value)
         gContext.mGizmoSizeClipSpace = value
+    end
+
+    do -- [Port] scoped to keep the factory under the 200-locals limit
+    local function GetViewManipulateState()
+        local id = GetCurrentID()
+        local state = gContext.mViewManipulateStates[id]
+        if state == nil then
+            state = { mID = id, mIsDragging = false, mIsClicking = false, mInterpolationFrames = 0,
+                mInterpolationUp = makeVect(0, 0), mInterpolationDir = makeVect(0, 0) }
+            gContext.mViewManipulateStates[id] = state
+        end
+        return state
+    end
+
+    -- [Port] frustum is a 1-based array of 6 vec_t; clip is a 1-based m16
+    local function ComputeFrustumPlanes(clip)
+        local c = clip
+        local frustum = {
+            makeVect(c[4] - c[1], c[8] - c[5], c[12] - c[9], c[16] - c[13]),
+            makeVect(c[4] + c[1], c[8] + c[5], c[12] + c[9], c[16] + c[13]),
+            makeVect(c[4] + c[2], c[8] + c[6], c[12] + c[10], c[16] + c[14]),
+            makeVect(c[4] - c[2], c[8] - c[6], c[12] - c[10], c[16] - c[14]),
+            makeVect(c[4] - c[3], c[8] - c[7], c[12] - c[11], c[16] - c[15]),
+            makeVect(c[4] + c[3], c[8] + c[7], c[12] + c[11], c[16] + c[15]),
+        }
+        for i = 1, 6 do
+            frustum[i]:Normalize()
+        end
+        return frustum
+    end
+
+    -- [Port] matrices: flat 1-based array of matrixCount * 16 numbers (or an array of 16-arrays)
+    local function GetMatrixAt(matrices, i)
+        if type(matrices[1]) == "table" then
+            return matrix_t.new(matrices[i + 1])
+        end
+        local m = matrix_t.new()
+        for k = 1, 16 do m[k] = matrices[i * 16 + k] end
+        return m
+    end
+
+    function ImGuizmo.DrawAxes(view, projection, matrices, matrixCount)
+        local viewM = matrix_t.new(view)
+        local projM = matrix_t.new(projection)
+        local viewProj = viewM * projM
+
+        -- build frustum
+        local frustum = ComputeFrustumPlanes(viewProj)
+
+        local axes = {
+            { dir = makeVect(1, 0, 0), color = IM_COL32(255, 0, 0, 255) }, -- X - red
+            { dir = makeVect(0, 1, 0), color = IM_COL32(0, 255, 0, 255) }, -- Y - green
+            { dir = makeVect(0, 0, 1), color = IM_COL32(0, 0, 255, 255) }, -- Z - blue
+        }
+        for i = 0, matrixCount - 1 do
+            local model = GetMatrixAt(matrices, i)
+            local mvp = model * viewProj
+
+            -- world-space origin
+            local origin = makeVect(0, 0)
+            origin:TransformPoint(makeVect(0, 0, 0), model)
+
+            for a = 1, 3 do
+                local endLocal = axes[a].dir
+
+                -- world-space endpoint
+                local _end = makeVect(0, 0)
+                _end:TransformPoint(endLocal, model)
+
+                -- frustum test
+                local visible = true
+                for f = 1, 6 do
+                    local d0 = DistanceToPlane(origin, frustum[f])
+                    local d1 = DistanceToPlane(_end, frustum[f])
+
+                    -- both outside - reject
+                    if d0 < 0 and d1 < 0 then
+                        visible = false
+                        break
+                    end
+                end
+
+                if visible then
+                    -- project to screen
+                    local p0 = worldToPos(makeVect(0, 0, 0), mvp)
+                    local p1 = worldToPos(endLocal, mvp)
+
+                    -- reject behind camera (clip space)
+                    local clip0, clip1 = makeVect(0, 0), makeVect(0, 0)
+                    clip0:TransformPoint(makeVect(0, 0, 0), mvp)
+                    clip1:TransformPoint(endLocal, mvp)
+
+                    if not (clip0.w <= 0 and clip1.w <= 0) then
+                        -- draw
+                        gContext.mDrawList:AddLine(p0, p1, axes[a].color, 2.0)
+                    end
+                end
+            end
+        end
+    end
+
+    function ImGuizmo.DrawCubes(view, projection, matrices, matrixCount)
+        local viewInverse = matrix_t.new()
+        viewInverse:Inverse(matrix_t.new(view))
+
+        local faces = {} -- [Port] array of { z, faceCoordsScreen, color } instead of _malloca
+
+        local viewProjection = matrix_t.new(view) * matrix_t.new(projection)
+        local frustum = ComputeFrustumPlanes(viewProjection)
+
+        for cube = 0, matrixCount - 1 do
+            local matrix = GetMatrixAt(matrices, cube)
+
+            local res = matrix * viewProjection
+
+            for iFace = 0, 5 do
+                local normalIndex = (iFace % 3)
+                local perpXIndex = (normalIndex + 1) % 3
+                local perpYIndex = (normalIndex + 2) % 3
+                local invert = 1
+                if iFace > 2 then invert = -1 end
+                local dn, dx, dy = directionUnaryV[normalIndex], directionUnaryV[perpXIndex], directionUnaryV[perpYIndex]
+
+                local faceCoords = { dn + dx + dy, dn + dx - dy, dn - dx - dy, dn - dx + dy }
+
+                -- clipping
+                -- [Port] upstream's commented-out camSpacePosition skip omitted
+                local centerPositionVP = makeVect(0, 0)
+                centerPositionVP:TransformPoint(dn * 0.5 * invert, res)
+
+                local inFrustum = true
+                for iFrustum = 1, 6 do
+                    local plane = frustum[iFrustum]
+                    local allOutside = true
+                    for iCoord = 1, 4 do
+                        local worldPos = makeVect(0, 0)
+                        worldPos:TransformPoint(faceCoords[iCoord] * 0.5 * invert, matrix)
+                        if DistanceToPlane(worldPos, plane) >= 0 then
+                            allOutside = false
+                            break
+                        end
+                    end
+                    -- [Port] upstream `continue`s here without clearing inFrustum (no culling); kept as-is
+                end
+
+                if inFrustum then
+                    -- 3D->2D
+                    local faceCoordsScreen = {}
+                    for iCoord = 1, 4 do
+                        faceCoordsScreen[iCoord] = worldToPos(faceCoords[iCoord] * 0.5 * invert, res)
+                    end
+
+                    local directionColor = GetColorU32(COLOR.DIRECTION_X + normalIndex)
+                    table.insert(faces, {
+                        z = centerPositionVP.z / centerPositionVP.w,
+                        faceCoordsScreen = faceCoordsScreen,
+                        color = bor(directionColor, IM_COL32(0x80, 0x80, 0x80, 0)),
+                    })
+                end
+            end
+        end
+        table.sort(faces, function(a, b) return a.z > b.z end)
+        -- draw face with lighter color
+        for iFace = 1, #faces do
+            local cubeFace = faces[iFace]
+            gContext.mDrawList:AddConvexPolyFilled(cubeFace.faceCoordsScreen, 4, cubeFace.color)
+        end
+    end
+
+    -- [Port] clips ptA/ptB against the frustum in place; returns visible (shared by DrawGrid/DrawGridCustomColor)
+    local function ClipGridLine(frustum, ptA, ptB)
+        for i = 1, 6 do
+            local dA = DistanceToPlane(ptA, frustum[i])
+            local dB = DistanceToPlane(ptB, frustum[i])
+            if dA < 0 and dB < 0 then
+                return false
+            end
+            if not (dA > 0 and dB > 0) then
+                if dA < 0 then
+                    local len = abs(dA - dB)
+                    local t = abs(dA) / len
+                    ptA:Lerp(ptB, t)
+                end
+                if dB < 0 then
+                    local len = abs(dB - dA)
+                    local t = abs(dB) / len
+                    ptB:Lerp(ptA, t)
+                end
+            end
+        end
+        return true
+    end
+
+    local function GridLine(dir, f, gridSize)
+        if dir == 1 then
+            return makeVect(-gridSize, 0, f), makeVect(gridSize, 0, f)
+        end
+        return makeVect(f, 0, -gridSize), makeVect(f, 0, gridSize)
+    end
+
+    function ImGuizmo.DrawGrid(view, projection, matrix, gridSize)
+        local viewProjection = matrix_t.new(view) * matrix_t.new(projection)
+        local frustum = ComputeFrustumPlanes(viewProjection)
+        local res = matrix_t.new(matrix) * viewProjection
+
+        local f = -gridSize
+        while f <= gridSize do
+            for dir = 0, 1 do
+                local ptA, ptB = GridLine(dir, f, gridSize)
+                if ClipGridLine(frustum, ptA, ptB) then
+                    local col = IM_COL32(0x80, 0x80, 0x80, 0xFF)
+                    local thickness = 1.0
+                    if math.fmod(abs(f), 10) < FLT_EPSILON then
+                        col = IM_COL32(0x90, 0x90, 0x90, 0xFF)
+                        thickness = 1.5
+                    end
+                    if abs(f) < FLT_EPSILON then
+                        col = IM_COL32(0x40, 0x40, 0x40, 0xFF)
+                        thickness = 2.3
+                    end
+
+                    gContext.mDrawList:AddLine(worldToPos(ptA, res), worldToPos(ptB, res), col, thickness)
+                end
+            end
+            f += 1
+        end
+    end
+
+    function ImGuizmo.DrawGridCustomColor(view, projection, matrix, gridSize, majorStep, subdivision, majorCol, minorCol, centerCol)
+        -- Must have at least 1 subdivision
+        IM_ASSERT(subdivision > 0, "At least 1 segment required!")
+
+        local viewProjection = matrix_t.new(view) * matrix_t.new(projection)
+        local frustum = ComputeFrustumPlanes(viewProjection)
+        local res = matrix_t.new(matrix) * viewProjection
+
+        local minorStep = majorStep / subdivision
+        local lineCount = math.ceil(gridSize / minorStep)
+
+        for i = -lineCount, lineCount do
+            local f = i * minorStep
+
+            local isMajor = math.fmod(i, subdivision) == 0 -- [Port] C++ % truncates like fmod
+            local isCenter = (i == 0)
+
+            -- Styling
+            local col = minorCol
+            local thickness = 1.0
+            if isMajor then col = majorCol; thickness = 1.5 end
+            if isCenter then col = centerCol; thickness = 2.3 end
+
+            for dir = 0, 1 do
+                local ptA, ptB = GridLine(dir, f, gridSize)
+                if ClipGridLine(frustum, ptA, ptB) then
+                    gContext.mDrawList:AddLine(worldToPos(ptA, res), worldToPos(ptB, res), col, thickness)
+                end
+            end
+        end
+    end
+
+    function ImGuizmo.DrawGridCustom(view, projection, matrix, gridSize, majorStep, subdivision)
+        local majorCol = IM_COL32(0x80, 0x80, 0x80, 0xFF)
+        local minorCol = IM_COL32(0x90, 0x90, 0x90, 0xFF)
+        local centerCol = IM_COL32(0x40, 0x40, 0x40, 0xFF)
+        ImGuizmo.DrawGridCustomColor(view, projection, matrix, gridSize, majorStep, subdivision, majorCol, minorCol, centerCol)
+    end
+
+    -- panels
+    local panelPosition = { ImVec2(0.75, 0.75), ImVec2(0.25, 0.75), ImVec2(0, 0.75),
+        ImVec2(0.75, 0.25), ImVec2(0.25, 0.25), ImVec2(0, 0.25),
+        ImVec2(0.75, 0), ImVec2(0.25, 0), ImVec2(0, 0) }
+    local panelSize = { ImVec2(0.25, 0.25), ImVec2(0.5, 0.25), ImVec2(0.25, 0.25),
+        ImVec2(0.25, 0.5), ImVec2(0.5, 0.5), ImVec2(0.25, 0.5),
+        ImVec2(0.25, 0.25), ImVec2(0.5, 0.25), ImVec2(0.25, 0.25) }
+    local overBox = -1 -- [Port] function-level static in upstream
+
+    local function ViewManipulateCube(view, length, position, size, backgroundColor)
+        -- State is bound to the current id (PushID/PopID) so multiple view cubes are independent.
+        local vms = GetViewManipulateState()
+        local referenceUp = makeVect(0, 1, 0)
+
+        -- Recompute hovering for this widget's own window instead of relying on the last
+        -- Manipulate() call, otherwise only the most recently drawn view would react.
+        gContext.mbMouseOver = IsHoveringWindow()
+
+        local svgView = matrix_t.new(gContext.mViewMat)
+        local svgProjection = matrix_t.new(gContext.mProjectionMat)
+
+        local io = ImGui.GetIO()
+        local mp = io.MousePos
+        local viewManipulateHovered = gContext.mbMouseOver and mp.x >= position.x and mp.y >= position.y
+            and mp.x < position.x + size.x and mp.y < position.y + size.y -- [Port] ImRect::Contains
+        gContext.mDrawList:AddRectFilled(position, position + size, backgroundColor)
+        local viewInverse = matrix_t.new()
+        viewInverse:Inverse(matrix_t.new(view))
+        local rightHanded = gContext.mProjectionMat[12] < 0 -- m[2][3]
+        local handednessSign = -1
+        if rightHanded then handednessSign = 1 end
+        local camTarget = viewInverse:GetRow(3) - viewInverse:GetRow(2) * handednessSign * length
+
+        -- view/projection matrices
+        local distance = 3
+        local cubeProjection, cubeView = matrix_t.new(), matrix_t.new()
+        local fov = math.acos(distance / (sqrt(distance * distance + 3))) * RAD2DEG
+        Perspective(fov / sqrt(2), size.x / size.y, 0.01, 1000, cubeProjection, rightHanded)
+
+        local dir = makeVect(viewInverse[9], viewInverse[10], viewInverse[11])
+        local up = makeVect(viewInverse[5], viewInverse[6], viewInverse[7])
+        local eye = dir * handednessSign * distance
+        LookAt({ eye.x, eye.y, eye.z }, { 0, 0, 0 }, { up.x, up.y, up.z }, cubeView, rightHanded)
+
+        -- set context
+        gContext.mViewMat = cubeView
+        gContext.mProjectionMat = cubeProjection
+        gContext.mRayOrigin, gContext.mRayVector = ComputeCameraRay(position, size)
+
+        local res = cubeView * cubeProjection
+
+        -- tag faces
+        local boxes = {} -- [Port] 0-based bool[27], nil == false
+        for iPass = 0, 1 do
+            for iFace = 0, 5 do
+                local normalIndex = (iFace % 3)
+                local perpXIndex = (normalIndex + 1) % 3
+                local perpYIndex = (normalIndex + 2) % 3
+                local invert = 1
+                if iFace > 2 then invert = -1 end
+                local indexVectorX = directionUnaryV[perpXIndex] * invert
+                local indexVectorY = directionUnaryV[perpYIndex] * invert
+                local boxOrigin = directionUnaryV[normalIndex] * -invert - indexVectorX - indexVectorY
+
+                -- plan local space
+                local n = directionUnaryV[normalIndex] * invert
+                local viewSpaceNormal = n:Copy()
+                local viewSpacePoint = n * 0.5
+                viewSpaceNormal:TransformVector(cubeView)
+                viewSpaceNormal:Normalize()
+                viewSpacePoint:TransformPoint(cubeView)
+                local viewSpaceFacePlan = BuildPlan(viewSpacePoint, viewSpaceNormal)
+
+                -- back face culling
+                if viewSpaceFacePlan.w <= 0 then
+                    local facePlan = BuildPlan(n * 0.5, n)
+
+                    local len = IntersectRayPlane(gContext.mRayOrigin, gContext.mRayVector, facePlan)
+                    local posOnPlan = gContext.mRayOrigin + gContext.mRayVector * len - (n * 0.5)
+
+                    local localx = Dot(directionUnaryV[perpXIndex], posOnPlan) * invert + 0.5
+                    local localy = Dot(directionUnaryV[perpYIndex], posOnPlan) * invert + 0.5
+
+                    -- panels
+                    local dx = directionUnaryV[perpXIndex]
+                    local dy = directionUnaryV[perpYIndex]
+                    local origin = directionUnaryV[normalIndex] - dx - dy
+                    for iPanel = 0, 8 do
+                        local boxCoord = boxOrigin + indexVectorX * (iPanel % 3) + indexVectorY * (iPanel // 3) + makeVect(1, 1, 1)
+                        local p = panelPosition[iPanel + 1] * 2
+                        local s = panelSize[iPanel + 1] * 2
+                        local faceCoordsScreen = {}
+                        local panelPos = { dx * p.x + dy * p.y,
+                            dx * p.x + dy * (p.y + s.y),
+                            dx * (p.x + s.x) + dy * (p.y + s.y),
+                            dx * (p.x + s.x) + dy * p.y }
+
+                        for iCoord = 1, 4 do
+                            faceCoordsScreen[iCoord] = worldToPos((panelPos[iCoord] + origin) * 0.5 * invert, res, position, size)
+                        end
+
+                        local c0 = panelPosition[iPanel + 1]
+                        local c1 = c0 + panelSize[iPanel + 1]
+                        local insidePanel = localx > c0.x and localx < c1.x and localy > c0.y and localy < c1.y
+                        local boxCoordInt = math.floor(boxCoord.x * 9 + boxCoord.y * 3 + boxCoord.z + 0.5) -- [Port] round: int() of an exact float sum
+                        IM_ASSERT(boxCoordInt < 27)
+                        boxes[boxCoordInt] = boxes[boxCoordInt] or (insidePanel and (not vms.mIsDragging) and gContext.mbMouseOver)
+
+                        -- draw face with lighter color
+                        if iPass == 1 then
+                            local directionColor = GetColorU32(COLOR.DIRECTION_X + normalIndex)
+                            local hoverTint = 0
+                            if viewManipulateHovered then hoverTint = IM_COL32(0x08, 0x08, 0x08, 0) end
+                            gContext.mDrawList:AddConvexPolyFilled(faceCoordsScreen, 4, bor(directionColor, IM_COL32(0x80, 0x80, 0x80, 0x80), hoverTint))
+                            if boxes[boxCoordInt] then
+                                local selectionColor = GetColorU32(COLOR.SELECTION)
+                                gContext.mDrawList:AddConvexPolyFilled(faceCoordsScreen, 4, selectionColor)
+
+                                if ImGui.IsMouseDown(0) and not vms.mIsClicking and not vms.mIsDragging and ImGui.GetCurrentContext().ActiveId == 0 then
+                                    overBox = boxCoordInt
+                                    vms.mIsClicking = true
+                                    vms.mIsDragging = true
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if vms.mInterpolationFrames ~= 0 then
+            vms.mInterpolationFrames -= 1
+            -- [Port] upstream's discarded newDir/newUp lerps dropped: newUp = interpolationUp and the
+            -- eye uses newDir, so keep newDir only
+            local newDir = viewInverse:GetRow(2) * handednessSign
+            newDir:Lerp(vms.mInterpolationDir * handednessSign, 0.2)
+            newDir:Normalize()
+
+            local newUp = vms.mInterpolationUp
+            local newEye = camTarget + newDir * length
+            LookAt({ newEye.x, newEye.y, newEye.z }, { camTarget.x, camTarget.y, camTarget.z }, { newUp.x, newUp.y, newUp.z }, view, rightHanded)
+        end
+        gContext.mIsViewManipulatorHovered = gContext.mIsViewManipulatorHovered or viewManipulateHovered
+
+        if ImGui.IsMouseDown(0) and (abs(io.MouseDelta.x) ~= 0 or abs(io.MouseDelta.y) ~= 0) and vms.mIsClicking then
+            vms.mIsClicking = false
+        end
+
+        if not ImGui.IsMouseDown(0) then
+            if vms.mIsClicking then
+                -- apply new view direction
+                local cx = overBox // 9
+                local cy = (overBox - cx * 9) // 3
+                local cz = overBox % 3
+                vms.mInterpolationDir = makeVect(1 - cx, 1 - cy, 1 - cz) * handednessSign
+                vms.mInterpolationDir:Normalize()
+
+                if abs(Dot(vms.mInterpolationDir, referenceUp)) > 1.0 - 0.01 then
+                    local right = viewInverse:GetRow(0)
+                    if abs(right.x) > abs(right.z) then
+                        right.z = 0
+                    else
+                        right.x = 0
+                    end
+                    right:Normalize()
+                    vms.mInterpolationUp = Cross(vms.mInterpolationDir * handednessSign, right)
+                    vms.mInterpolationUp:Normalize()
+                else
+                    vms.mInterpolationUp = referenceUp
+                end
+                vms.mInterpolationFrames = 40
+            end
+            vms.mIsClicking = false
+            vms.mIsDragging = false
+        end
+
+        if vms.mIsDragging then
+            local rx, ry = matrix_t.new(), matrix_t.new()
+            rx:RotationAxis(referenceUp, -io.MouseDelta.x * 0.01 * handednessSign)
+            ry:RotationAxis(viewInverse:GetRow(0), -io.MouseDelta.y * 0.01 * handednessSign)
+
+            local roll = rx * ry
+
+            local newDir = viewInverse:GetRow(2)
+            newDir:TransformVector(roll)
+            newDir:Normalize()
+
+            -- clamp
+            local planDir = Cross(viewInverse:GetRow(0), referenceUp)
+            planDir.y = 0
+            planDir:Normalize()
+            local dt = Dot(planDir, newDir)
+            if dt < 0 then
+                newDir = newDir + planDir * dt
+                newDir:Normalize()
+            end
+
+            local newEye = camTarget + newDir * handednessSign * length
+            LookAt({ newEye.x, newEye.y, newEye.z }, { camTarget.x, camTarget.y, camTarget.z }, { 0, 1, 0 }, view, rightHanded)
+        end
+
+        local thisUsingViewManipulate = (vms.mInterpolationFrames ~= 0) or vms.mIsDragging
+        gContext.mbUsingViewManipulate = gContext.mbUsingViewManipulate or thisUsingViewManipulate
+        if vms.mIsClicking or thisUsingViewManipulate or viewManipulateHovered then
+            ImGui.SetNextFrameWantCaptureMouse(true)
+        end
+
+        -- restore view/projection because it was used to compute ray
+        ComputeContext(svgView, svgProjection, gContext.mModelSource, gContext.mMode)
+    end
+
+    -- [Port] overloads merged, dispatched on the 2nd argument:
+    --   ViewManipulate(view, length, position, size, backgroundColor)
+    --   ViewManipulate(view, projection, operation, mode, matrix, length, position, size, backgroundColor)
+    -- view is mutated in place.
+    function ImGuizmo.ViewManipulate(view, a2, ...)
+        if type(a2) == "number" then
+            ViewManipulateCube(view, a2, ...)
+            return
+        end
+        local projection = a2
+        local operation, mode, matrix, length, position, size, backgroundColor = ...
+        -- Scale is always local or matrix will be skewed when applying world scale or oriented matrix
+        local ctxMode = mode
+        if band(operation, OPERATION.SCALE) ~= 0 then ctxMode = ImGuizmo.MODE.LOCAL end
+        ComputeContext(view, projection, matrix, ctxMode)
+        ViewManipulateCube(view, length, position, size, backgroundColor)
+    end
+
+    ImGuizmo._ComputeFrustumPlanes = ComputeFrustumPlanes
+    end
+
+    ---------------------------------------------------------------------------
+    -- [Port] Roblox helpers (not in upstream). Matrices are 1-based 16-arrays in ImGuizmo's layout:
+    -- rows right/up/back/position, translation at [13..15]. Roblox is right-handed, -Z forward.
+    do
+        local Roblox = {}
+
+        -- CFrame -> 16-array. GetComponents rotation is row-major; its columns are right/up/back.
+        function Roblox.MatrixFromCFrame(cf)
+            local x, y, z, R00, R01, R02, R10, R11, R12, R20, R21, R22 = cf:GetComponents()
+            return { R00, R10, R20, 0, R01, R11, R21, 0, R02, R12, R22, 0, x, y, z, 1 }
+        end
+
+        -- 16-array -> CFrame, scaleVector3. The basis rows are normalized; their lengths are the scale.
+        function Roblox.CFrameFromMatrix(m)
+            local rows = {}
+            local scale = {}
+            for r = 0, 2 do
+                local v = makeVect(m[r * 4 + 1], m[r * 4 + 2], m[r * 4 + 3])
+                scale[r + 1] = v:Length()
+                v:Normalize()
+                rows[r + 1] = v
+            end
+            local rt, up, bk = rows[1], rows[2], rows[3]
+            local cf = CFrame.new(m[13], m[14], m[15], rt.x, up.x, bk.x, rt.y, up.y, bk.y, rt.z, up.z, bk.z)
+            return cf, Vector3.new(scale[1], scale[2], scale[3])
+        end
+
+        -- camera.CFrame inverse, as a view matrix
+        function Roblox.ViewFromCamera(camera)
+            local view = matrix_t.new()
+            view:Inverse(matrix_t.new(Roblox.MatrixFromCFrame(camera.CFrame)))
+            local out = {}
+            for i = 1, 16 do out[i] = view[i] end
+            return out
+        end
+
+        -- camera.FieldOfView is the vertical FOV in degrees; [Port] upstream Perspective takes the half angle
+        function Roblox.ProjFromCamera(camera, near, far)
+            local vp = camera.ViewportSize
+            local proj = {}
+            Perspective(camera.FieldOfView * 0.5, vp.X / vp.Y, near or 0.1, far or 1000, proj, true)
+            return proj
+        end
+
+        ImGuizmo.Roblox = Roblox
     end
 
     -- [Port] internals exposed for tests
