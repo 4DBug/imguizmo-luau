@@ -2,6 +2,7 @@
 -- Usage: local ImGuizmo = require(path.to.ImGuizmo)(require(path.to.ImGui))
 return function(G)
     local ImGui, ImVec2, ImVec4 = G.ImGui, G.ImVec2, G.ImVec4
+    local IM_ASSERT, IM_COL32_WHITE = G.IM_ASSERT, G.IM_COL32_WHITE
     local ImGuizmo = {}
     local sqrt, abs, sin, cos, tan, atan2 = math.sqrt, math.abs, math.sin, math.cos, math.tan, math.atan2
     local bor = bit32.bor
@@ -489,6 +490,1067 @@ return function(G)
         -- [Port] write into caller's array in place (upstream aliases float*)
         for i = 1, 16 do matrix[i] = mat[i] end
     end
+
+    ---------------------------------------------------------------------------
+    -- context / style / translation gizmo
+    local band, lshift = bit32.band, bit32.lshift
+    local FLT_MAX = 3.402823466e+38
+
+    local function Intersects(lhs, rhs) return band(lhs, rhs) ~= 0 end
+    local function Contains(lhs, rhs) return band(lhs, rhs) == rhs end
+    local function IsWithin(x, y, z) return (x >= y) and (x <= z) end
+
+    -- [Port] MOVETYPE enum, same values as ImGuizmo.h
+    local MT_NONE, MT_MOVE_X, MT_MOVE_Y, MT_MOVE_Z, MT_MOVE_YZ, MT_MOVE_ZX, MT_MOVE_XY, MT_MOVE_SCREEN = 0, 1, 2, 3, 4, 5, 6, 7
+    local MT_ROTATE_X, MT_ROTATE_SCREEN, MT_SCALE_X, MT_SCALE_XYZ = 8, 11, 12, 15
+    ImGuizmo.MOVETYPE = {
+        MT_NONE = 0, MT_MOVE_X = 1, MT_MOVE_Y = 2, MT_MOVE_Z = 3, MT_MOVE_YZ = 4, MT_MOVE_ZX = 5, MT_MOVE_XY = 6, MT_MOVE_SCREEN = 7,
+        MT_ROTATE_X = 8, MT_ROTATE_Y = 9, MT_ROTATE_Z = 10, MT_ROTATE_SCREEN = 11,
+        MT_SCALE_X = 12, MT_SCALE_Y = 13, MT_SCALE_Z = 14, MT_SCALE_XYZ = 15,
+    }
+
+    -- [Port] COLOR enum, 0-based like upstream; Style.Colors is indexed with these values
+    local COLOR = {
+        DIRECTION_X = 0, DIRECTION_Y = 1, DIRECTION_Z = 2, PLANE_X = 3, PLANE_Y = 4, PLANE_Z = 5,
+        SELECTION = 6, INACTIVE = 7, TRANSLATION_LINE = 8, SCALE_LINE = 9, ROTATION_USING_BORDER = 10,
+        ROTATION_USING_FILL = 11, HATCHED_AXIS_LINES = 12, TEXT = 13, TEXT_SHADOW = 14, COUNT = 15,
+    }
+    ImGuizmo.COLOR = COLOR
+
+    local function IsTranslateType(type)
+        return type >= MT_MOVE_X and type <= MT_MOVE_SCREEN
+    end
+
+    -- Matches MT_MOVE_AB order
+    local TRANSLATE_PLANS = { [0] = bor(OPERATION.TRANSLATE_Y, OPERATION.TRANSLATE_Z), bor(OPERATION.TRANSLATE_X, OPERATION.TRANSLATE_Z), bor(OPERATION.TRANSLATE_X, OPERATION.TRANSLATE_Y) }
+
+    local function Style()
+        local s = {}
+        -- default values
+        s.TranslationLineThickness   = 3.0
+        s.TranslationLineArrowSize   = 6.0
+        s.RotationLineThickness      = 2.0
+        s.RotationOuterLineThickness = 3.0
+        s.ScaleLineThickness         = 3.0
+        s.ScaleLineCircleSize        = 6.0
+        s.HatchedAxisLineThickness   = 6.0
+        s.CenterCircleSize           = 6.0
+
+        -- initialize default colors
+        local Colors = {}
+        Colors[COLOR.DIRECTION_X]           = ImVec4(0.666, 0.000, 0.000, 1.000)
+        Colors[COLOR.DIRECTION_Y]           = ImVec4(0.000, 0.666, 0.000, 1.000)
+        Colors[COLOR.DIRECTION_Z]           = ImVec4(0.000, 0.000, 0.666, 1.000)
+        Colors[COLOR.PLANE_X]               = ImVec4(0.666, 0.000, 0.000, 0.380)
+        Colors[COLOR.PLANE_Y]               = ImVec4(0.000, 0.666, 0.000, 0.380)
+        Colors[COLOR.PLANE_Z]               = ImVec4(0.000, 0.000, 0.666, 0.380)
+        Colors[COLOR.SELECTION]             = ImVec4(1.000, 0.500, 0.062, 0.541)
+        Colors[COLOR.INACTIVE]              = ImVec4(0.600, 0.600, 0.600, 0.600)
+        Colors[COLOR.TRANSLATION_LINE]      = ImVec4(0.666, 0.666, 0.666, 0.666)
+        Colors[COLOR.SCALE_LINE]            = ImVec4(0.250, 0.250, 0.250, 1.000)
+        Colors[COLOR.ROTATION_USING_BORDER] = ImVec4(1.000, 0.500, 0.062, 1.000)
+        Colors[COLOR.ROTATION_USING_FILL]   = ImVec4(1.000, 0.500, 0.062, 0.500)
+        Colors[COLOR.HATCHED_AXIS_LINES]    = ImVec4(0.000, 0.000, 0.000, 0.500)
+        Colors[COLOR.TEXT]                  = ImVec4(1.000, 1.000, 1.000, 1.000)
+        Colors[COLOR.TEXT_SHADOW]           = ImVec4(0.000, 0.000, 0.000, 1.000)
+        s.Colors = Colors
+        return s
+    end
+
+    -- [Port] bool/float [3] arrays are 0-based (indexed by axisIndex)
+    local function TripodState()
+        return { mBelowAxisLimit = { [0] = false, false, false }, mBelowPlaneLimit = { [0] = false, false, false }, mAxisFactor = { [0] = 1, 1, 1 } }
+    end
+    local function CopyTripodState(dst, src) -- [Port] C++ struct assignment
+        for i = 0, 2 do
+            dst.mBelowAxisLimit[i] = src.mBelowAxisLimit[i]
+            dst.mBelowPlaneLimit[i] = src.mBelowPlaneLimit[i]
+            dst.mAxisFactor[i] = src.mAxisFactor[i]
+        end
+    end
+
+    -- [Port] ViewManipulateState / mViewManipulateStates not ported yet (ViewManipulate is TODO)
+    local gContext = {
+        mDrawList = nil,
+        mStyle = Style(),
+
+        mMode = ImGuizmo.MODE.LOCAL,
+        mViewMat = matrix_t.new(),
+        mProjectionMat = matrix_t.new(),
+        mModel = matrix_t.new(),
+        mModelLocal = matrix_t.new(), -- orthonormalized model
+        mModelInverse = matrix_t.new(),
+        mModelSource = matrix_t.new(),
+        mModelSourceInverse = matrix_t.new(),
+        mMVP = matrix_t.new(),
+        mMVPLocal = matrix_t.new(), -- MVP with full model matrix whereas mMVP's model matrix might only be translation in case of World space edition
+        mViewProjection = matrix_t.new(),
+
+        mModelScaleOrigin = makeVect(0, 0),
+        mCameraEye = makeVect(0, 0),
+        mCameraRight = makeVect(0, 0),
+        mCameraDir = makeVect(0, 0),
+        mCameraUp = makeVect(0, 0),
+        mRayOrigin = makeVect(0, 0),
+        mRayVector = makeVect(0, 0),
+
+        mRadiusSquareCenter = 0,
+        mScreenSquareCenter = ImVec2(0, 0),
+        mScreenSquareMin = ImVec2(0, 0),
+        mScreenSquareMax = ImVec2(0, 0),
+
+        mScreenFactor = 0,
+        mRelativeOrigin = makeVect(0, 0),
+
+        mbUsing = false,
+        mbUsingViewManipulate = false,
+        mbEnable = true,
+        mbMouseOver = false,
+        mIsViewManipulatorHovered = false,
+
+        -- translation
+        mTranslationPlan = makeVect(0, 0),
+        mTranslationPlanOrigin = makeVect(0, 0),
+        mMatrixOrigin = makeVect(0, 0),
+        mTranslationLastDelta = makeVect(0, 0),
+
+        mAxisMask = 0,
+        -- Current camera-dependent state and the frozen state of the active drag.
+        mTripodState = TripodState(),
+        mActiveTripodState = TripodState(),
+
+        mAxisLimit = 0.0025,
+        mPlaneLimit = 0.02,
+
+        mbUsingBounds = false,
+
+        --
+        mCurrentHandleType = MT_NONE,
+        mHoveredHandleType = MT_NONE,
+
+        mX = 0,
+        mY = 0,
+        mWidth = 0,
+        mHeight = 0,
+        mXMax = 0,
+        mYMax = 0,
+        mDisplayRatio = 1,
+
+        mIsOrthographic = false,
+        -- check to not have multiple gizmo highlighted at the same time
+        mbOverGizmoHotspot = false,
+        -- snapshot of mbOverGizmoHotspot from the previous complete frame, so IsOver()
+        -- reports hovering over any gizmo regardless of when it is called
+        mbOverGizmoHotspotLastFrame = false,
+
+        mAlternativeWindow = nil,
+        mIDStack = {}, -- [Port] plain 1-based array of ImGuiID
+        mEditingID = -1,
+        mOperation = 0,
+
+        mAllowAxisFlip = true,
+        mGizmoSizeClipSpace = 0.1,
+    }
+
+    local function GetCurrentID()
+        local stack = gContext.mIDStack
+        if #stack == 0 then
+            stack[1] = -1
+        end
+        return stack[#stack]
+    end
+
+    local function GetTripodState()
+        if gContext.mbUsing and GetCurrentID() == gContext.mEditingID then
+            return gContext.mActiveTripodState
+        end
+        return gContext.mTripodState
+    end
+
+    local directionUnaryV = { [0] = directionUnary[1], directionUnary[2], directionUnary[3] } -- [Port] 0-based view of directionUnary
+    local translationInfoMask = { [0] = "X : %5.3f", "Y : %5.3f", "Z : %5.3f",
+        "Y : %5.3f Z : %5.3f", "X : %5.3f Z : %5.3f", "X : %5.3f Y : %5.3f",
+        "X : %5.3f Y : %5.3f Z : %5.3f" }
+    local translationInfoIndex = { [0] = 0,0,0, 1,0,0, 2,0,0, 1,2,0, 0,2,0, 0,1,0, 0,1,2 }
+    local quadMin = 0.5
+    local quadMax = 0.8
+    local quadUV = { [0] = quadMin, quadMin, quadMin, quadMax, quadMax, quadMax, quadMax, quadMin }
+    local snapTension = 0.5
+
+    local function vecComp(v, i) -- [Port] vec_t::operator[] (0-based)
+        if i == 0 then return v.x elseif i == 1 then return v.y elseif i == 2 then return v.z end
+        return v.w
+    end
+
+    ---------------------------------------------------------------------------
+    --
+    local GetMoveType, GetRotateType, GetScaleType
+
+    function ImGuizmo.GetStyle()
+        return gContext.mStyle
+    end
+
+    local function GetColorU32(idx)
+        IM_ASSERT(idx < COLOR.COUNT)
+        return ImGui.ColorConvertFloat4ToU32(gContext.mStyle.Colors[idx])
+    end
+
+    local function worldToPos(worldPos, mat, position, size)
+        if position == nil then position = ImVec2(gContext.mX, gContext.mY) end
+        if size == nil then size = ImVec2(gContext.mWidth, gContext.mHeight) end
+        local trans = makeVect(0, 0)
+        trans:TransformPoint(worldPos, mat)
+        if abs(trans.w) < FLT_EPSILON then
+            return ImVec2(-FLT_MAX, -FLT_MAX)
+        end
+        trans:MulScalar(0.5 / trans.w)
+        trans = trans + makeVect(0.5, 0.5)
+        trans.y = 1 - trans.y
+        trans.x *= size.x
+        trans.y *= size.y
+        trans.x += position.x
+        trans.y += position.y
+        return ImVec2(trans.x, trans.y)
+    end
+
+    -- [Port] returns rayOrigin, rayDir instead of writing references
+    local function ComputeCameraRayEx(viewMatrix, projectionMatrix, mousePosition, position, size)
+        local mViewProjInverse = matrix_t.new()
+        mViewProjInverse:Inverse(viewMatrix * projectionMatrix)
+
+        local mox = ((mousePosition.x - position.x) / size.x) * 2 - 1
+        local moy = (1 - ((mousePosition.y - position.y) / size.y)) * 2 - 1
+
+        -- Unproject the mouse at both depth extremes of the clip volume.
+        -- A near-zero w means the extreme lies at infinity (an infinite far plane): keep the
+        -- homogeneous coordinates in that case instead of dividing by ~0.
+        local hA, hB = makeVect(0, 0), makeVect(0, 0)
+        hA:Transform(makeVect(mox, moy, 0, 1), mViewProjInverse)
+        hB:Transform(makeVect(mox, moy, 1 - FLT_EPSILON, 1), mViewProjInverse)
+        local aAtInfinity = abs(hA.w) < FLT_EPSILON
+        local bAtInfinity = abs(hB.w) < FLT_EPSILON
+        local pointA, pointB = hA, hB
+        if not aAtInfinity then pointA = hA * (1 / hA.w) end
+        if not bAtInfinity then pointB = hB * (1 / hB.w) end
+
+        -- Camera position. Derived from the view matrix so it is also correct when this is
+        -- called for the ViewManipulate cube (which swaps the view/projection matrices).
+        local viewInverse = matrix_t.new()
+        viewInverse:Inverse(viewMatrix)
+        local eye = viewInverse:GetRow(3)
+
+        -- Use the unprojected extreme closest to the camera as the ray origin. (see upstream, issue #423)
+        local nearPoint, farPoint, farAtInfinity
+        if (pointA - eye):LengthSq() <= (pointB - eye):LengthSq() then
+            nearPoint = pointA; farPoint = pointB; farAtInfinity = bAtInfinity
+        else
+            nearPoint = pointB; farPoint = pointA; farAtInfinity = aAtInfinity
+        end
+
+        -- With an infinite far plane the far extreme is unusable, so take the direction from
+        -- the camera through the near point (equivalent, and always finite for perspective).
+        local rayDir
+        if farAtInfinity then
+            rayDir = Normalized(nearPoint - eye)
+        else
+            rayDir = Normalized(farPoint - nearPoint)
+        end
+        return nearPoint:Copy(), rayDir
+    end
+
+    local function ComputeCameraRay(position, size)
+        if position == nil then position = ImVec2(gContext.mX, gContext.mY) end
+        if size == nil then size = ImVec2(gContext.mWidth, gContext.mHeight) end
+        local io = ImGui.GetIO()
+        return ComputeCameraRayEx(gContext.mViewMat, gContext.mProjectionMat, io.MousePos, position, size)
+    end
+
+    function ImGuizmo.ComputeMouseRay(view, projection, mousePosition, rectPosition, rectSize, rayOrigin, rayDirection)
+        local origin, dir = ComputeCameraRayEx(matrix_t.new(view), matrix_t.new(projection), mousePosition, rectPosition, rectSize)
+        rayOrigin[1] = origin.x; rayOrigin[2] = origin.y; rayOrigin[3] = origin.z
+        rayDirection[1] = dir.x; rayDirection[2] = dir.y; rayDirection[3] = dir.z
+    end
+
+    local function GetSegmentLengthClipSpace(start, _end, localCoordinates)
+        local startOfSegment = start:Copy()
+        local mvp = gContext.mMVP
+        if localCoordinates then mvp = gContext.mMVPLocal end
+        startOfSegment:TransformPoint(mvp)
+        if abs(startOfSegment.w) > FLT_EPSILON then -- check for axis aligned with camera direction
+            startOfSegment:MulScalar(1 / startOfSegment.w)
+        end
+
+        local endOfSegment = _end:Copy()
+        endOfSegment:TransformPoint(mvp)
+        if abs(endOfSegment.w) > FLT_EPSILON then -- check for axis aligned with camera direction
+            endOfSegment:MulScalar(1 / endOfSegment.w)
+        end
+
+        local clipSpaceAxis = endOfSegment - startOfSegment
+        if gContext.mDisplayRatio < 1.0 then
+            clipSpaceAxis.x *= gContext.mDisplayRatio
+        else
+            clipSpaceAxis.y /= gContext.mDisplayRatio
+        end
+        local segmentLengthInClipSpace = sqrt(clipSpaceAxis.x * clipSpaceAxis.x + clipSpaceAxis.y * clipSpaceAxis.y)
+        return segmentLengthInClipSpace
+    end
+
+    local function GetParallelogram(ptO, ptA, ptB)
+        local pts = { ptO:Copy(), ptA:Copy(), ptB:Copy() }
+        for i = 1, 3 do
+            pts[i]:TransformPoint(gContext.mMVP)
+            if abs(pts[i].w) > FLT_EPSILON then -- check for axis aligned with camera direction
+                pts[i]:MulScalar(1 / pts[i].w)
+            end
+        end
+        local segA = pts[2] - pts[1]
+        local segB = pts[3] - pts[1]
+        segA.y /= gContext.mDisplayRatio
+        segB.y /= gContext.mDisplayRatio
+        local segAOrtho = makeVect(-segA.y, segA.x)
+        segAOrtho:Normalize()
+        local dt = segAOrtho:Dot3(segB)
+        local surface = sqrt(segA.x * segA.x + segA.y * segA.y) * abs(dt)
+        return surface
+    end
+
+    local function PointOnSegment(point, vertPos1, vertPos2)
+        local c = point - vertPos1
+        local V = makeVect(0, 0)
+
+        V:Normalize(vertPos2 - vertPos1)
+        local d = (vertPos2 - vertPos1):Length()
+        local t = V:Dot3(c)
+
+        if t < 0 then
+            return vertPos1
+        end
+
+        if t > d then
+            return vertPos2
+        end
+
+        return vertPos1 + V * t
+    end
+
+    local function IntersectRayPlane(rOrigin, rVector, plan)
+        local numer = plan:Dot3(rOrigin) - plan.w
+        local denom = plan:Dot3(rVector)
+
+        if abs(denom) < FLT_EPSILON then -- normal is orthogonal to vector, cant intersect
+            return -1.0
+        end
+
+        return -(numer / denom)
+    end
+
+    local function DistanceToPlane(point, plan)
+        return plan:Dot3(point) + plan.w
+    end
+
+    local function IsInContextRect(p)
+        return IsWithin(p.x, gContext.mX, gContext.mXMax) and IsWithin(p.y, gContext.mY, gContext.mYMax)
+    end
+
+    local function IsHoveringWindow()
+        local g = ImGui.GetCurrentContext()
+        local window = ImGui.FindWindowByName(gContext.mDrawList._OwnerName)
+        if g.HoveredWindow == window then -- Mouse hovering drawlist window
+            return true
+        end
+        if gContext.mAlternativeWindow ~= nil and g.HoveredWindow == gContext.mAlternativeWindow then
+            return true
+        end
+        if g.HoveredWindow ~= nil then -- Any other window is hovered
+            return false
+        end
+        if ImGui.IsMouseHoveringRect(window.InnerRect.Min, window.InnerRect.Max, false) then -- Hovering drawlist window rect, while no other window is hovered (for _NoInputs windows)
+            return true
+        end
+        return false
+    end
+
+    function ImGuizmo.SetRect(x, y, width, height)
+        gContext.mX = x
+        gContext.mY = y
+        gContext.mWidth = width
+        gContext.mHeight = height
+        gContext.mXMax = gContext.mX + gContext.mWidth
+        gContext.mYMax = gContext.mY + gContext.mHeight
+        gContext.mDisplayRatio = width / height
+    end
+
+    function ImGuizmo.SetOrthographic(isOrthographic)
+        gContext.mIsOrthographic = isOrthographic
+    end
+
+    function ImGuizmo.SetDrawlist(drawlist)
+        gContext.mDrawList = drawlist or ImGui.GetWindowDrawList()
+    end
+
+    function ImGuizmo.SetImGuiContext(ctx)
+        ImGui.SetCurrentContext(ctx)
+    end
+
+    function ImGuizmo.BeginFrame()
+        local WF = G.ImGuiWindowFlags
+        local flags = bor(WF.NoTitleBar, WF.NoResize, WF.NoScrollbar, WF.NoInputs, WF.NoSavedSettings, WF.NoFocusOnAppearing, WF.NoBringToFrontOnFocus)
+
+        -- [Port] IMGUI_HAS_VIEWPORT path (core is the docking branch)
+        ImGui.SetNextWindowSize(ImGui.GetMainViewport().Size)
+        ImGui.SetNextWindowPos(ImGui.GetMainViewport().Pos)
+
+        ImGui.PushStyleColor(G.ImGuiCol.WindowBg, 0)
+        ImGui.PushStyleColor(G.ImGuiCol.Border, 0)
+        ImGui.PushStyleVar(G.ImGuiStyleVar.WindowRounding, 0.0)
+
+        ImGui.Begin("gizmo", nil, flags)
+        gContext.mDrawList = ImGui.GetWindowDrawList()
+        gContext.mbOverGizmoHotspotLastFrame = gContext.mbOverGizmoHotspot
+        gContext.mbOverGizmoHotspot = false
+        -- view manipulate flags accumulate across every ViewManipulate call of the frame
+        gContext.mbUsingViewManipulate = false
+        gContext.mIsViewManipulatorHovered = false
+        ImGui.End()
+        ImGui.PopStyleVar()
+        ImGui.PopStyleColor(2)
+    end
+
+    function ImGuizmo.IsUsing()
+        return (gContext.mbUsing and (GetCurrentID() == gContext.mEditingID)) or gContext.mbUsingBounds
+    end
+
+    function ImGuizmo.IsUsingViewManipulate()
+        return gContext.mbUsingViewManipulate
+    end
+
+    function ImGuizmo.IsViewManipulateHovered()
+        return gContext.mIsViewManipulatorHovered
+    end
+
+    function ImGuizmo.IsUsingAny()
+        return gContext.mbUsing or gContext.mbUsingBounds
+    end
+
+    -- [Port] overloads merged: IsOver(), IsOver(op), IsOver(position, pixelRadius)
+    function ImGuizmo.IsOver(op, pixelRadius)
+        if type(op) == "table" then
+            local io = ImGui.GetIO()
+            local p = worldToPos(makeVect(op[1], op[2], op[3], 0), gContext.mViewProjection) - io.MousePos
+            local radius = sqrt(p.x * p.x + p.y * p.y)
+            return radius < pixelRadius
+        end
+        if op == nil then
+            -- mbOverGizmoHotspotLastFrame is accumulated across every Manipulate call of the
+            -- previous frame, so this reports hovering over any gizmo instead of only the last one.
+            -- IsUsingAny() (not IsUsing()) is used so an active drag is detected even when IsOver()
+            -- is queried outside the PushID scope of the gizmo being manipulated.
+            return gContext.mbOverGizmoHotspotLastFrame or ImGuizmo.IsUsingAny()
+        end
+        if ImGuizmo.IsUsing() then
+            return true
+        end
+        if Intersects(op, bor(OPERATION.SCALE, OPERATION.SCALEU)) and GetScaleType(op) ~= MT_NONE then
+            return true
+        end
+        if Intersects(op, OPERATION.ROTATE) and GetRotateType(op) ~= MT_NONE then
+            return true
+        end
+        if Intersects(op, OPERATION.TRANSLATE) and GetMoveType(op, nil) ~= MT_NONE then
+            return true
+        end
+        return false
+    end
+
+    function ImGuizmo.GetActiveHandleType()
+        if not gContext.mbUsing or GetCurrentID() ~= gContext.mEditingID then
+            return MT_NONE
+        end
+        return gContext.mCurrentHandleType
+    end
+
+    function ImGuizmo.GetHoveredHandleType()
+        return gContext.mHoveredHandleType
+    end
+
+    ImGuizmo.GetActiveMoveType = ImGuizmo.GetActiveHandleType
+    ImGuizmo.GetHoveredMoveType = ImGuizmo.GetHoveredHandleType
+
+    function ImGuizmo.Enable(enable)
+        gContext.mbEnable = enable
+        if not enable then
+            -- Only cancel an ongoing interaction when the gizmo being disabled is the one
+            -- currently edited. Otherwise disabling one gizmo would wipe the shared using
+            -- state and break another gizmo that is still enabled/being manipulated.
+            if not gContext.mbUsing or GetCurrentID() == gContext.mEditingID then
+                gContext.mbUsing = false
+                gContext.mbUsingBounds = false
+                gContext.mCurrentHandleType = MT_NONE
+                gContext.mHoveredHandleType = MT_NONE
+            end
+        end
+    end
+
+    local function ComputeContext(view, projection, matrix, mode)
+        gContext.mMode = mode
+        gContext.mViewMat = matrix_t.new(view)
+        gContext.mProjectionMat = matrix_t.new(projection)
+        gContext.mbMouseOver = IsHoveringWindow()
+
+        gContext.mModelLocal = matrix_t.new(matrix)
+        gContext.mModelLocal:OrthoNormalize()
+
+        if mode == ImGuizmo.MODE.LOCAL then
+            gContext.mModel = matrix_t.new(gContext.mModelLocal)
+        else
+            gContext.mModel:Translation(matrix[13], matrix[14], matrix[15])
+        end
+        gContext.mModelSource = matrix_t.new(matrix)
+        local ms = gContext.mModelSource
+        gContext.mModelScaleOrigin:Set(ms:GetRow(0):Length(), ms:GetRow(1):Length(), ms:GetRow(2):Length())
+
+        gContext.mModelInverse:Inverse(gContext.mModel)
+        gContext.mModelSourceInverse:Inverse(gContext.mModelSource)
+        gContext.mViewProjection = gContext.mViewMat * gContext.mProjectionMat
+        gContext.mMVP = gContext.mModel * gContext.mViewProjection
+        gContext.mMVPLocal = gContext.mModelLocal * gContext.mViewProjection
+
+        local viewInverse = matrix_t.new()
+        viewInverse:Inverse(gContext.mViewMat)
+        gContext.mCameraDir = viewInverse:GetRow(2)
+        gContext.mCameraEye = viewInverse:GetRow(3)
+        gContext.mCameraRight = viewInverse:GetRow(0)
+        gContext.mCameraUp = viewInverse:GetRow(1)
+
+        -- compute scale from the size of camera right vector projected on screen at the matrix position
+        -- [Port] upstream's unused pointRight computation dropped
+        local rightViewInverse = viewInverse:GetRow(0)
+        rightViewInverse:TransformVector(gContext.mModelInverse)
+        local rightLength = GetSegmentLengthClipSpace(makeVect(0, 0), rightViewInverse)
+        gContext.mScreenFactor = gContext.mGizmoSizeClipSpace / rightLength
+
+        local centerSSpace = worldToPos(makeVect(0, 0), gContext.mMVP)
+        gContext.mScreenSquareCenter = centerSSpace
+        gContext.mScreenSquareMin = ImVec2(centerSSpace.x - 10, centerSSpace.y - 10)
+        gContext.mScreenSquareMax = ImVec2(centerSSpace.x + 10, centerSSpace.y + 10)
+
+        gContext.mRayOrigin, gContext.mRayVector = ComputeCameraRay()
+    end
+
+    -- [Port] colors is a 0-based table (colors[0..6])
+    local function ComputeColors(colors, type, operation)
+        if gContext.mbEnable then
+            local selectionColor = GetColorU32(COLOR.SELECTION)
+
+            if operation == OPERATION.TRANSLATE then
+                if type == MT_MOVE_SCREEN then colors[0] = selectionColor else colors[0] = IM_COL32_WHITE end
+                for i = 0, 2 do
+                    if type == MT_MOVE_X + i then colors[i + 1] = selectionColor else colors[i + 1] = GetColorU32(COLOR.DIRECTION_X + i) end
+                    if type == MT_MOVE_YZ + i then colors[i + 4] = selectionColor else colors[i + 4] = GetColorU32(COLOR.PLANE_X + i) end
+                    if type == MT_MOVE_SCREEN then colors[i + 4] = selectionColor end
+                end
+            elseif operation == OPERATION.ROTATE then
+                if type == MT_ROTATE_SCREEN then colors[0] = selectionColor else colors[0] = IM_COL32_WHITE end
+                for i = 0, 2 do
+                    if type == MT_ROTATE_X + i then colors[i + 1] = selectionColor else colors[i + 1] = GetColorU32(COLOR.DIRECTION_X + i) end
+                end
+            elseif operation == OPERATION.SCALEU or operation == OPERATION.SCALE then
+                if type == MT_SCALE_XYZ then colors[0] = selectionColor else colors[0] = IM_COL32_WHITE end
+                for i = 0, 2 do
+                    if type == MT_SCALE_X + i then colors[i + 1] = selectionColor else colors[i + 1] = GetColorU32(COLOR.DIRECTION_X + i) end
+                end
+            end
+            -- note: this internal function is only called with three possible values for operation
+        else
+            local inactiveColor = GetColorU32(COLOR.INACTIVE)
+            for i = 0, 6 do
+                colors[i] = inactiveColor
+            end
+        end
+    end
+
+    -- [Port] returns dirAxis, dirPlaneX, dirPlaneY, belowAxisLimit, belowPlaneLimit
+    local function ComputeTripodAxisAndVisibility(axisIndex, localCoordinates)
+        local dirAxis = directionUnaryV[axisIndex]:Copy()
+        local dirPlaneX = directionUnaryV[(axisIndex + 1) % 3]:Copy()
+        local dirPlaneY = directionUnaryV[(axisIndex + 2) % 3]:Copy()
+        local belowAxisLimit, belowPlaneLimit
+        local tripodState = GetTripodState()
+        local axisBit = lshift(1, axisIndex)
+
+        if gContext.mbUsing and (GetCurrentID() == gContext.mEditingID) then
+            -- when using, use stored factors so the gizmo doesn't flip when we translate
+
+            -- Apply axis mask to axes and planes
+            belowAxisLimit = tripodState.mBelowAxisLimit[axisIndex] and band(axisBit, gContext.mAxisMask) == 0
+            belowPlaneLimit = tripodState.mBelowPlaneLimit[axisIndex] and ((axisBit == gContext.mAxisMask) or gContext.mAxisMask == 0)
+
+            dirAxis:MulScalar(tripodState.mAxisFactor[axisIndex])
+            dirPlaneX:MulScalar(tripodState.mAxisFactor[(axisIndex + 1) % 3])
+            dirPlaneY:MulScalar(tripodState.mAxisFactor[(axisIndex + 2) % 3])
+        else
+            -- new method
+            local zero = makeVect(0, 0, 0)
+            local lenDir = GetSegmentLengthClipSpace(zero, dirAxis, localCoordinates)
+            local lenDirMinus = GetSegmentLengthClipSpace(zero, -dirAxis, localCoordinates)
+
+            local lenDirPlaneX = GetSegmentLengthClipSpace(zero, dirPlaneX, localCoordinates)
+            local lenDirMinusPlaneX = GetSegmentLengthClipSpace(zero, -dirPlaneX, localCoordinates)
+
+            local lenDirPlaneY = GetSegmentLengthClipSpace(zero, dirPlaneY, localCoordinates)
+            local lenDirMinusPlaneY = GetSegmentLengthClipSpace(zero, -dirPlaneY, localCoordinates)
+
+            -- For readability
+            local allowFlip = gContext.mAllowAxisFlip
+            local mulAxis, mulAxisX, mulAxisY = 1, 1, 1
+            if allowFlip and lenDir < lenDirMinus and abs(lenDir - lenDirMinus) > FLT_EPSILON then mulAxis = -1 end
+            if allowFlip and lenDirPlaneX < lenDirMinusPlaneX and abs(lenDirPlaneX - lenDirMinusPlaneX) > FLT_EPSILON then mulAxisX = -1 end
+            if allowFlip and lenDirPlaneY < lenDirMinusPlaneY and abs(lenDirPlaneY - lenDirMinusPlaneY) > FLT_EPSILON then mulAxisY = -1 end
+            dirAxis:MulScalar(mulAxis)
+            dirPlaneX:MulScalar(mulAxisX)
+            dirPlaneY:MulScalar(mulAxisY)
+
+            -- for axis
+            local axisLengthInClipSpace = GetSegmentLengthClipSpace(zero, dirAxis * gContext.mScreenFactor, localCoordinates)
+
+            local paraSurf = GetParallelogram(zero, dirPlaneX * gContext.mScreenFactor, dirPlaneY * gContext.mScreenFactor)
+            -- Apply axis mask to axes and planes
+            belowPlaneLimit = (paraSurf > gContext.mAxisLimit) and ((axisBit == gContext.mAxisMask) or gContext.mAxisMask == 0)
+            belowAxisLimit = (axisLengthInClipSpace > gContext.mPlaneLimit) and band(axisBit, gContext.mAxisMask) == 0
+
+            -- and store values
+            tripodState.mAxisFactor[axisIndex] = mulAxis
+            tripodState.mAxisFactor[(axisIndex + 1) % 3] = mulAxisX
+            tripodState.mAxisFactor[(axisIndex + 2) % 3] = mulAxisY
+            tripodState.mBelowAxisLimit[axisIndex] = belowAxisLimit
+            tripodState.mBelowPlaneLimit[axisIndex] = belowPlaneLimit
+        end
+        return dirAxis, dirPlaneX, dirPlaneY, belowAxisLimit, belowPlaneLimit
+    end
+
+    -- [Port] float* overload returns the snapped value
+    local function ComputeSnap(value, snap)
+        if snap <= FLT_EPSILON then
+            return value
+        end
+
+        local modulo = math.fmod(value, snap)
+        local moduloRatio = abs(modulo) / snap
+        if moduloRatio < snapTension then
+            value -= modulo
+        elseif moduloRatio > (1 - snapTension) then
+            local sgn = 1
+            if value < 0 then sgn = -1 end
+            value = value - modulo + snap * sgn
+        end
+        return value
+    end
+    local function ComputeSnapV(value, snap) -- [Port] vec_t overload, snap is a 1-based float[3]
+        value.x = ComputeSnap(value.x, snap[1])
+        value.y = ComputeSnap(value.y, snap[2])
+        value.z = ComputeSnap(value.z, snap[3])
+    end
+
+    local function DrawHatchedAxis(axis)
+        if gContext.mStyle.HatchedAxisLineThickness <= 0.0 then
+            return
+        end
+
+        for j = 1, 9 do
+            local baseSSpace2 = worldToPos(axis * (0.05 * (j * 2) * gContext.mScreenFactor), gContext.mMVP)
+            local worldDirSSpace2 = worldToPos(axis * (0.05 * (j * 2 + 1) * gContext.mScreenFactor), gContext.mMVP)
+            gContext.mDrawList:AddLine(baseSSpace2, worldDirSSpace2, GetColorU32(COLOR.HATCHED_AXIS_LINES), gContext.mStyle.HatchedAxisLineThickness)
+        end
+    end
+
+    local function DrawRotationGizmo(op, type) end -- [Port] TODO
+    local function DrawScaleGizmo(op, type) end -- [Port] TODO
+    local function DrawScaleUniveralGizmo(op, type) end -- [Port] TODO
+
+    local function DrawTranslationGizmo(op, type)
+        local drawList = gContext.mDrawList
+        if not drawList then
+            return
+        end
+
+        if not Intersects(op, OPERATION.TRANSLATE) then
+            return
+        end
+
+        -- colors
+        local colors = {}
+        ComputeColors(colors, type, OPERATION.TRANSLATE)
+
+        local origin = worldToPos(gContext.mModel:GetRow(3), gContext.mViewProjection)
+
+        -- draw
+        for i = 0, 2 do
+            local dirAxis, dirPlaneX, dirPlaneY, belowAxisLimit, belowPlaneLimit = ComputeTripodAxisAndVisibility(i)
+
+            if not gContext.mbUsing or (gContext.mbUsing and type == MT_MOVE_X + i) then
+                -- draw axis
+                if belowAxisLimit and Intersects(op, lshift(OPERATION.TRANSLATE_X, i)) then
+                    local baseSSpace = worldToPos(dirAxis * (0.1 * gContext.mScreenFactor), gContext.mMVP)
+                    local worldDirSSpace = worldToPos(dirAxis * gContext.mScreenFactor, gContext.mMVP)
+
+                    drawList:AddLine(baseSSpace, worldDirSSpace, colors[i + 1], gContext.mStyle.TranslationLineThickness)
+
+                    -- Arrow head begin
+                    local dx, dy = origin.x - worldDirSSpace.x, origin.y - worldDirSSpace.y
+
+                    local d = sqrt(dx * dx + dy * dy)
+                    dx /= d; dy /= d -- Normalize
+                    dx *= gContext.mStyle.TranslationLineArrowSize
+                    dy *= gContext.mStyle.TranslationLineArrowSize
+
+                    local ox, oy = dy, -dx -- Perpendicular vector
+                    local ax, ay = worldDirSSpace.x + dx, worldDirSSpace.y + dy
+                    drawList:AddTriangleFilled(ImVec2(worldDirSSpace.x - dx, worldDirSSpace.y - dy), ImVec2(ax + ox, ay + oy), ImVec2(ax - ox, ay - oy), colors[i + 1])
+                    -- Arrow head end
+
+                    if GetTripodState().mAxisFactor[i] < 0 then
+                        DrawHatchedAxis(dirAxis)
+                    end
+                end
+            end
+            -- draw plane
+            if not gContext.mbUsing or (gContext.mbUsing and type == MT_MOVE_YZ + i) then
+                if belowPlaneLimit and Contains(op, TRANSLATE_PLANS[i]) then
+                    local screenQuadPts = {}
+                    for j = 0, 3 do
+                        local cornerWorldPos = (dirPlaneX * quadUV[j * 2] + dirPlaneY * quadUV[j * 2 + 1]) * gContext.mScreenFactor
+                        screenQuadPts[j + 1] = worldToPos(cornerWorldPos, gContext.mMVP)
+                    end
+                    -- [Port] core has no public AddPolyline; _AddPolyline with FLT_MAX inner offset as AddQuad does
+                    drawList:_AddPolyline(screenQuadPts, 4, GetColorU32(COLOR.DIRECTION_X + i), 1.0, G.ImDrawFlags.Closed, FLT_MAX)
+                    drawList:AddConvexPolyFilled(screenQuadPts, 4, colors[i + 4])
+                end
+            end
+        end
+
+        drawList:AddCircleFilled(gContext.mScreenSquareCenter, gContext.mStyle.CenterCircleSize, colors[0], 32)
+
+        if gContext.mbUsing and (GetCurrentID() == gContext.mEditingID) and IsTranslateType(type) then
+            local translationLineColor = GetColorU32(COLOR.TRANSLATION_LINE)
+
+            local sourcePosOnScreen = worldToPos(gContext.mMatrixOrigin, gContext.mViewProjection)
+            local destinationPosOnScreen = worldToPos(gContext.mModel:GetRow(3), gContext.mViewProjection)
+            local dif = makeVect(destinationPosOnScreen.x - sourcePosOnScreen.x, destinationPosOnScreen.y - sourcePosOnScreen.y, 0, 0)
+            dif:Normalize()
+            dif:MulScalar(5)
+            drawList:AddCircle(sourcePosOnScreen, 6, translationLineColor)
+            drawList:AddCircle(destinationPosOnScreen, 6, translationLineColor)
+            drawList:AddLine(ImVec2(sourcePosOnScreen.x + dif.x, sourcePosOnScreen.y + dif.y), ImVec2(destinationPosOnScreen.x - dif.x, destinationPosOnScreen.y - dif.y), translationLineColor, 2)
+
+            local deltaInfo = gContext.mModel:GetRow(3) - gContext.mMatrixOrigin
+            local componentInfoIndex = (type - MT_MOVE_X) * 3
+            local tmps = string.format(translationInfoMask[type - MT_MOVE_X], vecComp(deltaInfo, translationInfoIndex[componentInfoIndex]), vecComp(deltaInfo, translationInfoIndex[componentInfoIndex + 1]), vecComp(deltaInfo, translationInfoIndex[componentInfoIndex + 2]))
+            drawList:AddText(ImVec2(destinationPosOnScreen.x + 15, destinationPosOnScreen.y + 15), GetColorU32(COLOR.TEXT_SHADOW), tmps)
+            drawList:AddText(ImVec2(destinationPosOnScreen.x + 14, destinationPosOnScreen.y + 14), GetColorU32(COLOR.TEXT), tmps)
+        end
+    end
+
+    local function CanActivate()
+        if ImGui.IsMouseClicked(0) and not ImGui.IsAnyItemHovered() and not ImGui.IsAnyItemActive() then
+            return true
+        end
+        return false
+    end
+
+    local function HandleAndDrawLocalBounds(bounds, matrix, snapValues, operation) return false end -- [Port] TODO
+    function GetScaleType(op) return MT_NONE end -- [Port] TODO
+    function GetRotateType(op) return MT_NONE end -- [Port] TODO
+
+    -- [Port] gizmoHitProportion: returns type, hitProportion instead of writing through a pointer
+    function GetMoveType(op, wantHitProportion)
+        if not Intersects(op, OPERATION.TRANSLATE) or gContext.mbUsing or not gContext.mbMouseOver then
+            return MT_NONE
+        end
+
+        local isNoAxesMasked = gContext.mAxisMask == 0
+        local isMultipleAxesMasked = band(gContext.mAxisMask, gContext.mAxisMask - 1) ~= 0
+
+        local io = ImGui.GetIO()
+        local type = MT_NONE
+        local gizmoHitProportion = nil
+
+        -- screen
+        if io.MousePos.x >= gContext.mScreenSquareMin.x and io.MousePos.x <= gContext.mScreenSquareMax.x and
+            io.MousePos.y >= gContext.mScreenSquareMin.y and io.MousePos.y <= gContext.mScreenSquareMax.y and
+            Contains(op, OPERATION.TRANSLATE) then
+            type = MT_MOVE_SCREEN
+        end
+
+        local screenCoord = makeVect(io.MousePos.x - gContext.mX, io.MousePos.y - gContext.mY)
+        local modelPos = gContext.mModel:GetRow(3)
+
+        -- compute
+        local i = 0
+        while i < 3 and type == MT_NONE do
+            local isAxisMasked = band(lshift(1, i), gContext.mAxisMask) ~= 0
+            local dirAxis, dirPlaneX, dirPlaneY, _belowAxisLimit, belowPlaneLimit = ComputeTripodAxisAndVisibility(i)
+            dirAxis:TransformVector(gContext.mModel)
+            dirPlaneX:TransformVector(gContext.mModel)
+            dirPlaneY:TransformVector(gContext.mModel)
+
+            local len = IntersectRayPlane(gContext.mRayOrigin, gContext.mRayVector, BuildPlan(modelPos, dirAxis))
+            local posOnPlan = gContext.mRayOrigin + gContext.mRayVector * len
+
+            local axisStartOnScreen = worldToPos(modelPos + dirAxis * (gContext.mScreenFactor * 0.1), gContext.mViewProjection)
+            local axisEndOnScreen = worldToPos(modelPos + dirAxis * gContext.mScreenFactor, gContext.mViewProjection)
+
+            local closestPointOnAxis = PointOnSegment(screenCoord, makeVect(axisStartOnScreen.x - gContext.mX, axisStartOnScreen.y - gContext.mY), makeVect(axisEndOnScreen.x - gContext.mX, axisEndOnScreen.y - gContext.mY))
+            if (closestPointOnAxis - screenCoord):Length() < 12 and Intersects(op, lshift(OPERATION.TRANSLATE_X, i)) then -- pixel size
+                if isAxisMasked then
+                    break
+                end
+                type = MT_MOVE_X + i
+            end
+
+            local dx = dirPlaneX:Dot3((posOnPlan - modelPos) * (1 / gContext.mScreenFactor))
+            local dy = dirPlaneY:Dot3((posOnPlan - modelPos) * (1 / gContext.mScreenFactor))
+            if belowPlaneLimit and dx >= quadUV[0] and dx <= quadUV[4] and dy >= quadUV[1] and dy <= quadUV[3] and Contains(op, TRANSLATE_PLANS[i]) then
+                if (not isAxisMasked or isMultipleAxesMasked) and not isNoAxesMasked then
+                    break
+                end
+                type = MT_MOVE_YZ + i
+            end
+
+            if wantHitProportion then
+                gizmoHitProportion = makeVect(dx, dy, 0)
+            end
+            i += 1
+        end
+        return type, gizmoHitProportion
+    end
+
+    -- [Port] returns modified, type (C++ MOVETYPE& type)
+    local function HandleTranslation(matrix, deltaMatrix, op, type, snap)
+        if not Intersects(op, OPERATION.TRANSLATE) or type ~= MT_NONE then
+            return false, type
+        end
+        local applyRotationLocaly = gContext.mMode == ImGuizmo.MODE.LOCAL or gContext.mCurrentHandleType == MT_MOVE_SCREEN
+        local modified = false
+
+        -- move
+        if gContext.mbUsing and (GetCurrentID() == gContext.mEditingID) and IsTranslateType(gContext.mCurrentHandleType) then
+            ImGui.SetNextFrameWantCaptureMouse(true)
+            local signedLength = IntersectRayPlane(gContext.mRayOrigin, gContext.mRayVector, gContext.mTranslationPlan)
+            local len = abs(signedLength) -- near plan
+            local newPos = gContext.mRayOrigin + gContext.mRayVector * len
+
+            -- compute delta
+            local newOrigin = newPos - gContext.mRelativeOrigin * gContext.mScreenFactor
+            local delta = newOrigin - gContext.mModel:GetRow(3)
+
+            -- 1 axis constraint
+            if gContext.mCurrentHandleType >= MT_MOVE_X and gContext.mCurrentHandleType <= MT_MOVE_Z then
+                local axisIndex = gContext.mCurrentHandleType - MT_MOVE_X
+                local axisValue = gContext.mModel:GetRow(axisIndex)
+                local lengthOnAxis = Dot(axisValue, delta)
+                delta = axisValue * lengthOnAxis
+            end
+
+            -- snap
+            if snap then
+                local cumulativeDelta = gContext.mModel:GetRow(3) + delta - gContext.mMatrixOrigin
+                if applyRotationLocaly then
+                    local modelSourceNormalized = matrix_t.new(gContext.mModelSource)
+                    modelSourceNormalized:OrthoNormalize()
+                    local modelSourceNormalizedInverse = matrix_t.new()
+                    modelSourceNormalizedInverse:Inverse(modelSourceNormalized)
+                    cumulativeDelta:TransformVector(modelSourceNormalizedInverse)
+                    ComputeSnapV(cumulativeDelta, snap)
+                    cumulativeDelta:TransformVector(modelSourceNormalized)
+                else
+                    ComputeSnapV(cumulativeDelta, snap)
+                end
+                delta = gContext.mMatrixOrigin + cumulativeDelta - gContext.mModel:GetRow(3)
+            end
+
+            local last = gContext.mTranslationLastDelta
+            if delta.x ~= last.x or delta.y ~= last.y or delta.z ~= last.z or delta.w ~= last.w then
+                modified = true
+            end
+            gContext.mTranslationLastDelta = delta
+
+            -- compute matrix & delta
+            local deltaMatrixTranslation = matrix_t.new()
+            deltaMatrixTranslation:Translation(delta)
+            if deltaMatrix then
+                for k = 1, 16 do deltaMatrix[k] = deltaMatrixTranslation[k] end
+            end
+
+            local res = gContext.mModelSource * deltaMatrixTranslation
+            for k = 1, 16 do matrix[k] = res[k] end -- [Port] write into caller's array in place
+
+            if not ImGui.IsMouseDown(0) then -- [Port] io.MouseDown[0]
+                gContext.mbUsing = false
+            end
+
+            type = gContext.mCurrentHandleType
+        else
+            -- find new possible way to move
+            if gContext.mbOverGizmoHotspot then
+                type = MT_NONE
+            else
+                type = GetMoveType(op, true)
+            end
+            gContext.mbOverGizmoHotspot = gContext.mbOverGizmoHotspot or type ~= MT_NONE
+            if type ~= MT_NONE then
+                ImGui.SetNextFrameWantCaptureMouse(true)
+            end
+            if CanActivate() and type ~= MT_NONE then
+                CopyTripodState(gContext.mActiveTripodState, gContext.mTripodState)
+                gContext.mbUsing = true
+                gContext.mEditingID = GetCurrentID()
+                gContext.mCurrentHandleType = type
+                local m = gContext.mModel
+                local movePlanNormal = { m:GetRow(0), m:GetRow(1), m:GetRow(2),
+                    m:GetRow(0), m:GetRow(1), m:GetRow(2),
+                    -gContext.mCameraDir }
+
+                local cameraToModelNormalized = Normalized(m:GetRow(3) - gContext.mCameraEye)
+                for k = 1, 3 do
+                    local orthoVector = Cross(movePlanNormal[k], cameraToModelNormalized)
+                    movePlanNormal[k]:Cross(orthoVector)
+                    movePlanNormal[k]:Normalize()
+                end
+                -- pickup plan
+                gContext.mTranslationPlan = BuildPlan(m:GetRow(3), movePlanNormal[type - MT_MOVE_X + 1])
+                local len = IntersectRayPlane(gContext.mRayOrigin, gContext.mRayVector, gContext.mTranslationPlan)
+                gContext.mTranslationPlanOrigin = gContext.mRayOrigin + gContext.mRayVector * len
+                gContext.mMatrixOrigin = m:GetRow(3)
+
+                gContext.mRelativeOrigin = (gContext.mTranslationPlanOrigin - m:GetRow(3)) * (1 / gContext.mScreenFactor)
+            end
+        end
+        return modified, type
+    end
+
+    local function HandleScale(matrix, deltaMatrix, op, type, snap) return false, type end -- [Port] TODO
+    local function HandleRotation(matrix, deltaMatrix, op, type, snap) return false, type end -- [Port] TODO
+
+    function ImGuizmo.SetAlternativeWindow(window)
+        gContext.mAlternativeWindow = window
+    end
+
+    function ImGuizmo.SetID(id)
+        local stack = gContext.mIDStack
+        if #stack == 0 then
+            stack[1] = -1
+        end
+        stack[#stack] = id
+    end
+
+    -- [Port] overloads merged: string (optional str_end exclusive 1-based), number (int), other (pointer -> tostring hash)
+    function ImGuizmo.GetID(str, str_end)
+        local seed = GetCurrentID()
+        if type(str) == "number" then
+            return G.ImHashData(str, -1, seed)
+        end
+        if type(str) ~= "string" then
+            str = tostring(str)
+        end
+        if str_end then
+            return G.ImHashStr(str, str_end - 1, seed)
+        end
+        return G.ImHashStr(str, nil, seed)
+    end
+
+    function ImGuizmo.PushID(str_id, str_id_end)
+        local id = ImGuizmo.GetID(str_id, str_id_end)
+        table.insert(gContext.mIDStack, id)
+    end
+
+    function ImGuizmo.PopID()
+        IM_ASSERT(#gContext.mIDStack > 1) -- Too many PopID(), or could be popping in a wrong/different window?
+        table.remove(gContext.mIDStack)
+    end
+
+    function ImGuizmo.AllowAxisFlip(value)
+        gContext.mAllowAxisFlip = value
+    end
+
+    function ImGuizmo.SetAxisLimit(value)
+        gContext.mAxisLimit = value
+    end
+
+    function ImGuizmo.SetAxisMask(x, y, z)
+        local m = 0
+        if x then m += 1 end
+        if y then m += 2 end
+        if z then m += 4 end
+        gContext.mAxisMask = m
+    end
+
+    function ImGuizmo.SetPlaneLimit(value)
+        gContext.mPlaneLimit = value
+    end
+
+    -- [Port] matrix/deltaMatrix are mutated in place; snap/localBounds/boundsSnap optional 1-based arrays
+    function ImGuizmo.Manipulate(view, projection, operation, mode, matrix, deltaMatrix, snap, localBounds, boundsSnap)
+        gContext.mDrawList:PushClipRect(ImVec2(gContext.mX, gContext.mY), ImVec2(gContext.mX + gContext.mWidth, gContext.mY + gContext.mHeight), false)
+
+        -- Scale is always local or matrix will be skewed when applying world scale or oriented matrix
+        local ctxMode = mode
+        if band(operation, OPERATION.SCALE) ~= 0 then ctxMode = ImGuizmo.MODE.LOCAL end
+        ComputeContext(view, projection, matrix, ctxMode)
+        gContext.mHoveredHandleType = MT_NONE
+
+        -- set delta to identity
+        if deltaMatrix then
+            matrix_t.SetToIdentity(deltaMatrix)
+        end
+
+        -- behind camera
+        local camSpacePosition = makeVect(0, 0)
+        camSpacePosition:TransformPoint(makeVect(0, 0, 0), gContext.mMVP)
+        if not gContext.mIsOrthographic and camSpacePosition.z < 0.001 and not gContext.mbUsing then
+            gContext.mDrawList:PopClipRect() -- [Port] upstream returns without popping; keep the clip stack balanced
+            return false
+        end
+
+        -- --
+        local type = MT_NONE
+        local manipulated = false
+        if gContext.mbEnable then
+            if not gContext.mbUsingBounds then
+                manipulated, type = HandleTranslation(matrix, deltaMatrix, operation, type, snap)
+                if not manipulated then manipulated, type = HandleScale(matrix, deltaMatrix, operation, type, snap) end
+                if not manipulated then manipulated, type = HandleRotation(matrix, deltaMatrix, operation, type, snap) end
+            end
+        end
+
+        if localBounds and not gContext.mbUsing then
+            manipulated = HandleAndDrawLocalBounds(localBounds, matrix, boundsSnap, operation) or manipulated
+        end
+
+        gContext.mOperation = operation
+        if not gContext.mbUsing and not gContext.mbUsingBounds then
+            gContext.mHoveredHandleType = type
+        else
+            gContext.mHoveredHandleType = MT_NONE
+        end
+        if not gContext.mbUsingBounds then
+            DrawRotationGizmo(operation, type)
+            DrawTranslationGizmo(operation, type)
+            DrawScaleGizmo(operation, type)
+            DrawScaleUniveralGizmo(operation, type)
+        end
+
+        gContext.mDrawList:PopClipRect()
+        return manipulated
+    end
+
+    function ImGuizmo.SetGizmoSizeClipSpace(value)
+        gContext.mGizmoSizeClipSpace = value
+    end
+
+    -- [Port] internals exposed for tests
+    ImGuizmo._context = gContext
+    ImGuizmo._worldToPos = worldToPos
 
     -- [Port] internals exposed for later layers and tests
     ImGuizmo._math = {
