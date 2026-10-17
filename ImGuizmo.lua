@@ -521,6 +521,22 @@ return function(G)
         return type >= MT_MOVE_X and type <= MT_MOVE_SCREEN
     end
 
+    local function IsRotateType(type)
+        return type >= MT_ROTATE_X and type <= MT_ROTATE_SCREEN
+    end
+
+    local function IsScaleType(type)
+        return type >= MT_SCALE_X and type <= MT_SCALE_XYZ
+    end
+
+    local function IM_COL32(r, g, b, a) -- [Port] local copy of the imgui macro
+        return bor(lshift(a, 24), lshift(b, 16), lshift(g, 8), r)
+    end
+    local IM_COL32_BLACK = IM_COL32(0, 0, 0, 255)
+
+    local screenRotateSize = 0.06
+    local rotationDisplayFactor = 1.2
+
     -- Matches MT_MOVE_AB order
     local TRANSLATE_PLANS = { [0] = bor(OPERATION.TRANSLATE_Y, OPERATION.TRANSLATE_Z), bor(OPERATION.TRANSLATE_X, OPERATION.TRANSLATE_Z), bor(OPERATION.TRANSLATE_X, OPERATION.TRANSLATE_Y) }
 
@@ -614,6 +630,17 @@ return function(G)
         mMatrixOrigin = makeVect(0, 0),
         mTranslationLastDelta = makeVect(0, 0),
 
+        -- rotation
+        mRotationVectorSource = makeVect(0, 0),
+        mRotationAngle = 0,
+        mRotationAngleOrigin = 0,
+
+        -- scale
+        mScale = makeVect(1, 1, 1),
+        mScaleValueOrigin = makeVect(0, 0),
+        mScaleLast = makeVect(0, 0),
+        mSaveMousePosx = 0,
+
         mAxisMask = 0,
         -- Current camera-dependent state and the frozen state of the active drag.
         mTripodState = TripodState(),
@@ -622,7 +649,15 @@ return function(G)
         mAxisLimit = 0.0025,
         mPlaneLimit = 0.02,
 
+        -- bounds stretching
+        mBoundsPivot = makeVect(0, 0),
+        mBoundsAnchor = makeVect(0, 0),
+        mBoundsPlan = makeVect(0, 0),
+        mBoundsLocalPivot = makeVect(0, 0),
+        mBoundsBestAxis = 0,
+        mBoundsAxis = { [0] = 0, 0 }, -- [Port] 0-based int[2]
         mbUsingBounds = false,
+        mBoundsMatrix = matrix_t.new(),
 
         --
         mCurrentHandleType = MT_NONE,
@@ -681,6 +716,12 @@ return function(G)
         if i == 0 then return v.x elseif i == 1 then return v.y elseif i == 2 then return v.z end
         return v.w
     end
+    local function vecSetComp(v, i, val) -- [Port] vec_t::operator[] as lvalue
+        if i == 0 then v.x = val elseif i == 1 then v.y = val elseif i == 2 then v.z = val else v.w = val end
+    end
+    local scaleInfoMask = { [0] = "X : %5.2f", "Y : %5.2f", "Z : %5.2f", "XYZ : %5.2f" }
+    local rotationInfoMask = { [0] = "X : %5.2f deg %5.2f rad", "Y : %5.2f deg %5.2f rad", "Z : %5.2f deg %5.2f rad", "Screen : %5.2f deg %5.2f rad" }
+    local halfCircleSegmentCount = 64
 
     ---------------------------------------------------------------------------
     --
@@ -1152,6 +1193,19 @@ return function(G)
         value.z = ComputeSnap(value.z, snap[3])
     end
 
+    local function ComputeAngleOnPlan()
+        local len = IntersectRayPlane(gContext.mRayOrigin, gContext.mRayVector, gContext.mTranslationPlan)
+        local localPos = Normalized(gContext.mRayOrigin + gContext.mRayVector * len - gContext.mModel:GetRow(3))
+
+        local perpendicularVector = makeVect(0, 0)
+        perpendicularVector:Cross(gContext.mRotationVectorSource, gContext.mTranslationPlan)
+        perpendicularVector:Normalize()
+        local acosAngle = math.clamp(Dot(localPos, gContext.mRotationVectorSource), -1, 1)
+        local angle = math.acos(acosAngle)
+        if Dot(localPos, perpendicularVector) >= 0 then angle = -angle end
+        return angle
+    end
+
     local function DrawHatchedAxis(axis)
         if gContext.mStyle.HatchedAxisLineThickness <= 0.0 then
             return
@@ -1164,9 +1218,207 @@ return function(G)
         end
     end
 
-    local function DrawRotationGizmo(op, type) end -- [Port] TODO
-    local function DrawScaleGizmo(op, type) end -- [Port] TODO
-    local function DrawScaleUniveralGizmo(op, type) end -- [Port] TODO
+    local function DrawRotationGizmo(op, type)
+        if not Intersects(op, OPERATION.ROTATE) then
+            return
+        end
+        local drawList = gContext.mDrawList
+
+        local isMultipleAxesMasked = band(gContext.mAxisMask, gContext.mAxisMask - 1) ~= 0
+        local isNoAxesMasked = gContext.mAxisMask == 0
+
+        -- colors
+        local colors = {}
+        ComputeColors(colors, type, OPERATION.ROTATE)
+
+        local viewDirNormalized
+        local viewInverse = matrix_t.new()
+        viewInverse:Inverse(gContext.mViewMat)
+        if gContext.mIsOrthographic then
+            viewDirNormalized = -viewInverse:GetRow(2)
+        else
+            -- In left-handed view matrices, mCameraDir points toward the scene instead of
+            -- toward the camera; negate it so we always get the "toward camera" direction,
+            -- which selects the correct front-facing half of each rotation ring.
+            local handSign = 1
+            if Dot(Cross(viewInverse:GetRow(0), viewInverse:GetRow(1)), viewInverse:GetRow(2)) < 0 then handSign = -1 end
+            viewDirNormalized = Normalized(gContext.mCameraDir) * handSign
+        end
+
+        viewDirNormalized:TransformVector(gContext.mModelInverse)
+
+        gContext.mRadiusSquareCenter = screenRotateSize * gContext.mHeight
+
+        local hasRSC = Intersects(op, OPERATION.ROTATE_SCREEN)
+        local modelScreenPos = worldToPos(gContext.mModel:GetRow(3), gContext.mViewProjection)
+        for axis = 0, 2 do
+            if Intersects(op, bit32.rshift(OPERATION.ROTATE_Z, axis)) then
+                local isAxisMasked = band(lshift(1, 2 - axis), gContext.mAxisMask) ~= 0
+
+                if not ((not isAxisMasked or isMultipleAxesMasked) and not isNoAxesMasked) then
+                    local usingAxis = (gContext.mbUsing and type == MT_ROTATE_X + 2 - axis)
+                    local circleMul = 2
+                    if hasRSC and not usingAxis then circleMul = 1 end
+
+                    local circlePos = {} -- [Port] 1-based
+                    local rightHanded = gContext.mProjectionMat[12] < 0
+                    local angleStart = atan2(vecComp(viewDirNormalized, (4 - axis) % 3), vecComp(viewDirNormalized, (3 - axis) % 3))
+                    if gContext.mIsOrthographic then angleStart += ZPI * 0.5 else angleStart -= ZPI * 0.5 end
+                    if not rightHanded then angleStart += ZPI end
+
+                    local count = circleMul * halfCircleSegmentCount + 1
+                    for i = 0, count - 1 do
+                        local ng = angleStart + circleMul * ZPI * (i / (circleMul * halfCircleSegmentCount))
+                        local axisPos = makeVect(cos(ng), sin(ng), 0)
+                        local pos = makeVect(vecComp(axisPos, axis), vecComp(axisPos, (axis + 1) % 3), vecComp(axisPos, (axis + 2) % 3)) * (gContext.mScreenFactor * rotationDisplayFactor)
+                        circlePos[i + 1] = worldToPos(pos, gContext.mMVP)
+                    end
+                    if not gContext.mbUsing or usingAxis then
+                        drawList:_AddPolyline(circlePos, count, colors[3 - axis], gContext.mStyle.RotationLineThickness, 0, FLT_MAX)
+                    end
+
+                    local d = modelScreenPos - circlePos[1]
+                    local radiusAxis = sqrt(d.x * d.x + d.y * d.y)
+                    if radiusAxis > gContext.mRadiusSquareCenter then
+                        gContext.mRadiusSquareCenter = radiusAxis
+                    end
+                end
+            end
+        end
+        if hasRSC and (not gContext.mbUsing or type == MT_ROTATE_SCREEN) and (not isMultipleAxesMasked and isNoAxesMasked) then
+            drawList:AddCircle(modelScreenPos, gContext.mRadiusSquareCenter, colors[0], 64, gContext.mStyle.RotationOuterLineThickness)
+        end
+
+        if gContext.mbUsing and (GetCurrentID() == gContext.mEditingID) and IsRotateType(type) then
+            local circlePos = {}
+
+            circlePos[1] = modelScreenPos
+            for i = 1, halfCircleSegmentCount do
+                local ng = gContext.mRotationAngle * ((i - 1) / (halfCircleSegmentCount - 1))
+                local rotateVectorMatrix = matrix_t.new()
+                rotateVectorMatrix:RotationAxis(gContext.mTranslationPlan, ng)
+                local pos = makeVect(0, 0)
+                pos:TransformPoint(gContext.mRotationVectorSource, rotateVectorMatrix)
+                pos:MulScalar(gContext.mScreenFactor * rotationDisplayFactor)
+                circlePos[i + 1] = worldToPos(pos + gContext.mModel:GetRow(3), gContext.mViewProjection)
+            end
+            drawList:AddConvexPolyFilled(circlePos, halfCircleSegmentCount + 1, GetColorU32(COLOR.ROTATION_USING_FILL))
+            drawList:_AddPolyline(circlePos, halfCircleSegmentCount + 1, GetColorU32(COLOR.ROTATION_USING_BORDER), gContext.mStyle.RotationLineThickness, G.ImDrawFlags.Closed, FLT_MAX)
+
+            local destinationPosOnScreen = circlePos[2]
+            local tmps = string.format(rotationInfoMask[type - MT_ROTATE_X], (gContext.mRotationAngle / ZPI) * 180, gContext.mRotationAngle)
+            drawList:AddText(ImVec2(destinationPosOnScreen.x + 15, destinationPosOnScreen.y + 15), GetColorU32(COLOR.TEXT_SHADOW), tmps)
+            drawList:AddText(ImVec2(destinationPosOnScreen.x + 14, destinationPosOnScreen.y + 14), GetColorU32(COLOR.TEXT), tmps)
+        end
+    end
+
+    local function DrawScaleGizmo(op, type)
+        local drawList = gContext.mDrawList
+
+        if not Intersects(op, OPERATION.SCALE) then
+            return
+        end
+
+        -- colors
+        local colors = {}
+        ComputeColors(colors, type, OPERATION.SCALE)
+
+        -- draw
+        local scaleDisplay = makeVect(1, 1, 1, 1)
+
+        if gContext.mbUsing and (GetCurrentID() == gContext.mEditingID) then
+            scaleDisplay = gContext.mScale
+        end
+
+        for i = 0, 2 do
+            local usingAxis = (gContext.mbUsing and type == MT_SCALE_X + i)
+            if Intersects(op, lshift(OPERATION.SCALE_X, i)) and (not gContext.mbUsing or usingAxis) then
+                local dirAxis, _dirPlaneX, _dirPlaneY, belowAxisLimit = ComputeTripodAxisAndVisibility(i, true)
+
+                -- draw axis
+                if belowAxisLimit then
+                    local hasTranslateOnAxis = Contains(op, lshift(OPERATION.TRANSLATE_X, i))
+                    local markerScale = 1.0
+                    if hasTranslateOnAxis then markerScale = 1.4 end
+                    local baseSSpace = worldToPos(dirAxis * (0.1 * gContext.mScreenFactor), gContext.mMVP)
+                    local worldDirSSpaceNoScale = worldToPos(dirAxis * (markerScale * gContext.mScreenFactor), gContext.mMVP)
+                    local worldDirSSpace = worldToPos(dirAxis * (markerScale * vecComp(scaleDisplay, i) * gContext.mScreenFactor), gContext.mMVP)
+
+                    if gContext.mbUsing and (GetCurrentID() == gContext.mEditingID) then
+                        local scaleLineColor = GetColorU32(COLOR.SCALE_LINE)
+                        drawList:AddLine(baseSSpace, worldDirSSpaceNoScale, scaleLineColor, gContext.mStyle.ScaleLineThickness)
+                        drawList:AddCircleFilled(worldDirSSpaceNoScale, gContext.mStyle.ScaleLineCircleSize, scaleLineColor)
+                    end
+
+                    if not hasTranslateOnAxis or gContext.mbUsing then
+                        drawList:AddLine(baseSSpace, worldDirSSpace, colors[i + 1], gContext.mStyle.ScaleLineThickness)
+                    end
+                    drawList:AddCircleFilled(worldDirSSpace, gContext.mStyle.ScaleLineCircleSize, colors[i + 1])
+
+                    if GetTripodState().mAxisFactor[i] < 0 then
+                        DrawHatchedAxis(dirAxis * vecComp(scaleDisplay, i))
+                    end
+                end
+            end
+        end
+
+        -- draw screen cirle
+        drawList:AddCircleFilled(gContext.mScreenSquareCenter, gContext.mStyle.CenterCircleSize, colors[0], 32)
+
+        if gContext.mbUsing and (GetCurrentID() == gContext.mEditingID) and IsScaleType(type) then
+            local destinationPosOnScreen = worldToPos(gContext.mModel:GetRow(3), gContext.mViewProjection)
+            local componentInfoIndex = (type - MT_SCALE_X) * 3
+            local tmps = string.format(scaleInfoMask[type - MT_SCALE_X], vecComp(scaleDisplay, translationInfoIndex[componentInfoIndex]))
+            drawList:AddText(ImVec2(destinationPosOnScreen.x + 15, destinationPosOnScreen.y + 15), GetColorU32(COLOR.TEXT_SHADOW), tmps)
+            drawList:AddText(ImVec2(destinationPosOnScreen.x + 14, destinationPosOnScreen.y + 14), GetColorU32(COLOR.TEXT), tmps)
+        end
+    end
+
+    local function DrawScaleUniveralGizmo(op, type)
+        local drawList = gContext.mDrawList
+
+        if not Intersects(op, OPERATION.SCALEU) then
+            return
+        end
+
+        -- colors
+        local colors = {}
+        ComputeColors(colors, type, OPERATION.SCALEU)
+
+        -- draw
+        local scaleDisplay = makeVect(1, 1, 1, 1)
+
+        if gContext.mbUsing and (GetCurrentID() == gContext.mEditingID) then
+            scaleDisplay = gContext.mScale
+        end
+
+        for i = 0, 2 do
+            local usingAxis = (gContext.mbUsing and type == MT_SCALE_X + i)
+            if Intersects(op, lshift(OPERATION.SCALE_XU, i)) and (not gContext.mbUsing or usingAxis) then
+                local dirAxis, _dirPlaneX, _dirPlaneY, belowAxisLimit = ComputeTripodAxisAndVisibility(i, true)
+
+                -- draw axis
+                if belowAxisLimit then
+                    local markerScale = 1.0
+                    if Contains(op, lshift(OPERATION.TRANSLATE_X, i)) then markerScale = 1.4 end
+                    local worldDirSSpace = worldToPos(dirAxis * (markerScale * vecComp(scaleDisplay, i) * gContext.mScreenFactor), gContext.mMVPLocal)
+                    -- [Port] upstream #if 0 block dropped
+                    drawList:AddCircleFilled(worldDirSSpace, 12, colors[i + 1])
+                end
+            end
+        end
+
+        -- draw screen cirle
+        drawList:AddCircle(gContext.mScreenSquareCenter, 20, colors[0], 32, gContext.mStyle.CenterCircleSize)
+
+        if gContext.mbUsing and (GetCurrentID() == gContext.mEditingID) and IsScaleType(type) then
+            local destinationPosOnScreen = worldToPos(gContext.mModel:GetRow(3), gContext.mViewProjection)
+            local componentInfoIndex = (type - MT_SCALE_X) * 3
+            local tmps = string.format(scaleInfoMask[type - MT_SCALE_X], vecComp(scaleDisplay, translationInfoIndex[componentInfoIndex]))
+            drawList:AddText(ImVec2(destinationPosOnScreen.x + 15, destinationPosOnScreen.y + 15), GetColorU32(COLOR.TEXT_SHADOW), tmps)
+            drawList:AddText(ImVec2(destinationPosOnScreen.x + 14, destinationPosOnScreen.y + 14), GetColorU32(COLOR.TEXT), tmps)
+        end
+    end
 
     local function DrawTranslationGizmo(op, type)
         local drawList = gContext.mDrawList
@@ -1258,9 +1510,423 @@ return function(G)
         return false
     end
 
-    local function HandleAndDrawLocalBounds(bounds, matrix, snapValues, operation) return false end -- [Port] TODO
-    function GetScaleType(op) return MT_NONE end -- [Port] TODO
-    function GetRotateType(op) return MT_NONE end -- [Port] TODO
+    -- [Port] bounds/snapValues are 1-based float[6]/float[3]; matrix is written in place
+    local function HandleAndDrawLocalBounds(bounds, matrix, snapValues, operation)
+        local io = ImGui.GetIO()
+        local drawList = gContext.mDrawList
+
+        local manipulated = false
+
+        -- compute best projection axis
+        local axesWorldDirections = {} -- [Port] 0-based
+        local bestAxisWorldDirection = makeVect(0, 0, 0, 0)
+        local axes = {} -- [Port] 0-based
+        local numAxes = 1
+        axes[0] = gContext.mBoundsBestAxis
+        local bestAxis = axes[0]
+        if not gContext.mbUsingBounds then
+            numAxes = 0
+            local bestDot = 0
+            for i = 0, 2 do
+                local dirPlaneNormalWorld = makeVect(0, 0)
+                dirPlaneNormalWorld:TransformVector(directionUnaryV[i], gContext.mModelSource)
+                dirPlaneNormalWorld:Normalize()
+
+                local dt = abs(Dot(Normalized(gContext.mCameraEye - gContext.mModelSource:GetRow(3)), dirPlaneNormalWorld))
+                if dt >= bestDot then
+                    bestDot = dt
+                    bestAxis = i
+                    bestAxisWorldDirection = dirPlaneNormalWorld
+                end
+
+                if dt >= 0.1 then
+                    axes[numAxes] = i
+                    axesWorldDirections[numAxes] = dirPlaneNormalWorld
+                    numAxes += 1
+                end
+            end
+        end
+
+        if numAxes == 0 then
+            axes[0] = bestAxis
+            axesWorldDirections[0] = bestAxisWorldDirection
+            numAxes = 1
+        elseif bestAxis ~= axes[0] then
+            local bestIndex = 0
+            for i = 0, numAxes - 1 do
+                if axes[i] == bestAxis then
+                    bestIndex = i
+                    break
+                end
+            end
+            axes[0], axes[bestIndex] = axes[bestIndex], axes[0]
+            axesWorldDirections[0], axesWorldDirections[bestIndex] = axesWorldDirections[bestIndex], axesWorldDirections[0]
+        end
+
+        local wEps = 1e-3
+        local AnchorBigRadius = 8
+        local AnchorSmallRadius = 6
+        local function clipToScreen(c)
+            local nx = c.x * (0.5 / c.w) + 0.5
+            local ny = c.y * (0.5 / c.w) + 0.5
+            ny = 1 - ny
+            return ImVec2(gContext.mX + nx * gContext.mWidth, gContext.mY + ny * gContext.mHeight)
+        end
+
+        for axisIndex = 0, numAxes - 1 do
+            bestAxis = axes[axisIndex]
+            bestAxisWorldDirection = axesWorldDirections[axisIndex]
+
+            -- corners
+            local aabb = {} -- [Port] 0-based
+
+            local secondAxis = (bestAxis + 1) % 3
+            local thirdAxis = (bestAxis + 2) % 3
+
+            for i = 0, 3 do
+                aabb[i] = makeVect(0, 0, 0, 0)
+                vecSetComp(aabb[i], secondAxis, bounds[secondAxis + 3 * bit32.rshift(i, 1) + 1])
+                vecSetComp(aabb[i], thirdAxis, bounds[thirdAxis + 3 * bit32.bxor(bit32.rshift(i, 1), band(i, 1)) + 1])
+            end
+
+            -- draw bounds
+            local anchorAlpha = IM_COL32(0, 0, 0, 0x80)
+            if gContext.mbEnable then anchorAlpha = IM_COL32_BLACK end
+            local greyColor = IM_COL32(0xAA, 0xAA, 0xAA, 0) + anchorAlpha
+
+            local boundsMVP = gContext.mModelSource * gContext.mViewProjection
+            for i = 0, 3 do
+                -- Clip the segment against the near plane (w >= eps) so the dashed
+                -- line still draws when an endpoint is behind the camera or outside
+                -- the viewport. ImDrawList clips to the 2D clip rect on its own.
+                local p0 = makeVect(0, 0); p0:TransformPoint(aabb[i], boundsMVP)
+                local p1 = makeVect(0, 0); p1:TransformPoint(aabb[(i + 1) % 4], boundsMVP)
+                local in0 = p0.w >= wEps
+                local in1 = p1.w >= wEps
+                if in0 or in1 then
+                    if not in0 then
+                        local t = (p1.w - wEps) / (p1.w - p0.w)
+                        p0.x = p1.x + (p0.x - p1.x) * t
+                        p0.y = p1.y + (p0.y - p1.y) * t
+                        p0.z = p1.z + (p0.z - p1.z) * t
+                        p0.w = wEps
+                    elseif not in1 then
+                        local t = (p0.w - wEps) / (p0.w - p1.w)
+                        p1.x = p0.x + (p1.x - p0.x) * t
+                        p1.y = p0.y + (p1.y - p0.y) * t
+                        p1.z = p0.z + (p1.z - p0.z) * t
+                        p1.w = wEps
+                    end
+                    local worldBound1 = clipToScreen(p0)
+                    local worldBound2 = clipToScreen(p1)
+                    local bd = worldBound1 - worldBound2
+                    local boundDistance = sqrt(bd.x * bd.x + bd.y * bd.y)
+                    local stepCount = math.min(math.floor(boundDistance / 10), 1000)
+                    for j = 0, stepCount - 1 do
+                        local stepLength = 1 / stepCount
+                        local t1 = j * stepLength
+                        local t2 = j * stepLength + stepLength * 0.5
+                        local worldBoundSS1 = worldBound1 + (worldBound2 - worldBound1) * t1
+                        local worldBoundSS2 = worldBound1 + (worldBound2 - worldBound1) * t2
+                        drawList:AddLine(worldBoundSS1, worldBoundSS2, greyColor, 2)
+                    end
+                    local midPoint = (aabb[i] + aabb[(i + 1) % 4]) * 0.5
+                    -- Per-anchor visibility: big anchor depends only on corner i;
+                    -- small anchor depends only on the midpoint of edge (i, i+1).
+                    local pCorner = makeVect(0, 0); pCorner:TransformPoint(aabb[i], boundsMVP)
+                    local pMid = makeVect(0, 0); pMid:TransformPoint(midPoint, boundsMVP)
+                    local worldBoundOrig = worldToPos(aabb[i], boundsMVP)
+                    local midBound = worldToPos(midPoint, boundsMVP)
+                    local bigAnchorVisible = pCorner.w >= wEps and IsInContextRect(worldBoundOrig)
+                    local smallAnchorVisible = pMid.w >= wEps and IsInContextRect(midBound)
+
+                    local db = worldBoundOrig - io.MousePos
+                    local dm = midBound - io.MousePos
+                    local overBigAnchor = bigAnchorVisible and (db.x * db.x + db.y * db.y) <= (AnchorBigRadius * AnchorBigRadius)
+                    local overSmallAnchor = smallAnchorVisible and (dm.x * dm.x + dm.y * dm.y) <= (AnchorBigRadius * AnchorBigRadius)
+
+                    local type = MT_NONE
+
+                    if Intersects(operation, OPERATION.TRANSLATE) then
+                        type = GetMoveType(operation, true)
+                    end
+                    if Intersects(operation, OPERATION.ROTATE) and type == MT_NONE then
+                        type = GetRotateType(operation)
+                    end
+                    if Intersects(operation, OPERATION.SCALE) and type == MT_NONE then
+                        type = GetScaleType(operation)
+                    end
+
+                    if type ~= MT_NONE then
+                        overBigAnchor = false
+                        overSmallAnchor = false
+                    end
+
+                    local selectionColor = GetColorU32(COLOR.SELECTION)
+
+                    local bigAnchorColor = greyColor
+                    if overBigAnchor then bigAnchorColor = selectionColor end
+                    local smallAnchorColor = greyColor
+                    if overSmallAnchor then smallAnchorColor = selectionColor end
+
+                    if bigAnchorVisible then
+                        drawList:AddCircleFilled(worldBoundOrig, AnchorBigRadius, IM_COL32_BLACK)
+                        drawList:AddCircleFilled(worldBoundOrig, AnchorBigRadius - 1.2, bigAnchorColor)
+                    end
+
+                    if smallAnchorVisible then
+                        drawList:AddCircleFilled(midBound, AnchorSmallRadius, IM_COL32_BLACK)
+                        drawList:AddCircleFilled(midBound, AnchorSmallRadius - 1.2, smallAnchorColor)
+                    end
+                    local oppositeIndex = (i + 2) % 4
+                    -- big anchor on corners
+                    if not gContext.mbUsingBounds and gContext.mbEnable and overBigAnchor and CanActivate() then
+                        gContext.mBoundsPivot:TransformPoint(aabb[(i + 2) % 4], gContext.mModelSource)
+                        gContext.mBoundsAnchor:TransformPoint(aabb[i], gContext.mModelSource)
+                        gContext.mBoundsPlan = BuildPlan(gContext.mBoundsAnchor, bestAxisWorldDirection)
+                        gContext.mBoundsBestAxis = bestAxis
+                        gContext.mBoundsAxis[0] = secondAxis
+                        gContext.mBoundsAxis[1] = thirdAxis
+
+                        gContext.mBoundsLocalPivot:Set(0)
+                        vecSetComp(gContext.mBoundsLocalPivot, secondAxis, vecComp(aabb[oppositeIndex], secondAxis))
+                        vecSetComp(gContext.mBoundsLocalPivot, thirdAxis, vecComp(aabb[oppositeIndex], thirdAxis))
+
+                        gContext.mbUsingBounds = true
+                        gContext.mEditingID = GetCurrentID()
+                        gContext.mBoundsMatrix = matrix_t.new(gContext.mModelSource)
+                    end
+                    -- small anchor on middle of segment
+                    if not gContext.mbUsingBounds and gContext.mbEnable and overSmallAnchor and CanActivate() then
+                        local midPointOpposite = (aabb[(i + 2) % 4] + aabb[(i + 3) % 4]) * 0.5
+                        gContext.mBoundsPivot:TransformPoint(midPointOpposite, gContext.mModelSource)
+                        gContext.mBoundsAnchor:TransformPoint(midPoint, gContext.mModelSource)
+                        gContext.mBoundsPlan = BuildPlan(gContext.mBoundsAnchor, bestAxisWorldDirection)
+                        gContext.mBoundsBestAxis = bestAxis
+                        local indices = { [0] = secondAxis, thirdAxis }
+                        gContext.mBoundsAxis[0] = indices[i % 2]
+                        gContext.mBoundsAxis[1] = -1
+
+                        gContext.mBoundsLocalPivot:Set(0)
+                        vecSetComp(gContext.mBoundsLocalPivot, gContext.mBoundsAxis[0], vecComp(aabb[oppositeIndex], indices[i % 2]))
+
+                        gContext.mbUsingBounds = true
+                        gContext.mEditingID = GetCurrentID()
+                        gContext.mBoundsMatrix = matrix_t.new(gContext.mModelSource)
+                    end
+                end
+            end
+
+            if gContext.mbUsingBounds and (GetCurrentID() == gContext.mEditingID) then
+                local scale = matrix_t.new()
+                scale:SetToIdentity()
+
+                -- compute projected mouse position on plan
+                local len = IntersectRayPlane(gContext.mRayOrigin, gContext.mRayVector, gContext.mBoundsPlan)
+                local newPos = gContext.mRayOrigin + gContext.mRayVector * len
+
+                -- compute a reference and delta vectors base on mouse move
+                local deltaVector = (newPos - gContext.mBoundsPivot):Abs()
+                local referenceVector = (gContext.mBoundsAnchor - gContext.mBoundsPivot):Abs()
+
+                -- for 1 or 2 axes, compute a ratio that's used for scale and snap it based on resulting length
+                for i = 0, 1 do
+                    local axisIndex1 = gContext.mBoundsAxis[i]
+                    if axisIndex1 ~= -1 then
+                        local ratioAxis = 1
+                        local axisDir = gContext.mBoundsMatrix:GetRow(axisIndex1):Abs()
+
+                        local dtAxis = axisDir:Dot(referenceVector)
+                        local boundSize = bounds[axisIndex1 + 4] - bounds[axisIndex1 + 1]
+                        if dtAxis > FLT_EPSILON then
+                            ratioAxis = axisDir:Dot(deltaVector) / dtAxis
+                        end
+
+                        if snapValues then
+                            local length = boundSize * ratioAxis
+                            length = ComputeSnap(length, snapValues[axisIndex1 + 1])
+                            if boundSize > FLT_EPSILON then
+                                ratioAxis = length / boundSize
+                            end
+                        end
+                        for c = 1, 4 do scale[axisIndex1 * 4 + c] *= ratioAxis end
+
+                        if abs(ratioAxis - 1) > FLT_EPSILON then
+                            manipulated = true
+                        end
+                    end
+                end
+
+                -- transform matrix
+                local preScale, postScale = matrix_t.new(), matrix_t.new()
+                preScale:Translation(-gContext.mBoundsLocalPivot)
+                postScale:Translation(gContext.mBoundsLocalPivot)
+                local res = preScale * scale * postScale * gContext.mBoundsMatrix
+                for k = 1, 16 do matrix[k] = res[k] end
+
+                -- info text
+                local destinationPosOnScreen = worldToPos(gContext.mModel:GetRow(3), gContext.mViewProjection)
+                local bm = gContext.mBoundsMatrix
+                local tmps = string.format("X: %.2f Y: %.2f Z: %.2f",
+                    (bounds[4] - bounds[1]) * bm:GetRow(0):Length() * scale:GetRow(0):Length(),
+                    (bounds[5] - bounds[2]) * bm:GetRow(1):Length() * scale:GetRow(1):Length(),
+                    (bounds[6] - bounds[3]) * bm:GetRow(2):Length() * scale:GetRow(2):Length())
+                drawList:AddText(ImVec2(destinationPosOnScreen.x + 15, destinationPosOnScreen.y + 15), GetColorU32(COLOR.TEXT_SHADOW), tmps)
+                drawList:AddText(ImVec2(destinationPosOnScreen.x + 14, destinationPosOnScreen.y + 14), GetColorU32(COLOR.TEXT), tmps)
+            end
+
+            if not ImGui.IsMouseDown(0) then -- [Port] io.MouseDown[0]
+                gContext.mbUsingBounds = false
+                gContext.mEditingID = -1
+            end
+            if gContext.mbUsingBounds then
+                break
+            end
+        end
+
+        return manipulated
+    end
+
+    ---------------------------------------------------------------------------
+    --
+
+    function GetScaleType(op)
+        if gContext.mbUsing then
+            return MT_NONE
+        end
+        local io = ImGui.GetIO()
+        local type = MT_NONE
+
+        -- screen
+        if io.MousePos.x >= gContext.mScreenSquareMin.x and io.MousePos.x <= gContext.mScreenSquareMax.x and
+            io.MousePos.y >= gContext.mScreenSquareMin.y and io.MousePos.y <= gContext.mScreenSquareMax.y and
+            Contains(op, OPERATION.SCALE) then
+            type = MT_SCALE_XYZ
+        end
+
+        -- compute
+        local modelPos = gContext.mModelLocal:GetRow(3)
+        local i = 0
+        while i < 3 and type == MT_NONE do
+            if Intersects(op, lshift(OPERATION.SCALE_X, i)) then
+                local isAxisMasked = band(lshift(1, i), gContext.mAxisMask) ~= 0
+
+                local dirAxis = ComputeTripodAxisAndVisibility(i, true)
+                dirAxis:TransformVector(gContext.mModelLocal)
+
+                local len = IntersectRayPlane(gContext.mRayOrigin, gContext.mRayVector, BuildPlan(modelPos, dirAxis))
+                local posOnPlan = gContext.mRayOrigin + gContext.mRayVector * len
+
+                local startOffset, endOffset = 0.1, 1.0
+                if Contains(op, lshift(OPERATION.TRANSLATE_X, i)) then startOffset, endOffset = 1.0, 1.4 end
+                local posOnPlanScreen = worldToPos(posOnPlan, gContext.mViewProjection)
+                local axisStartOnScreen = worldToPos(modelPos + dirAxis * (gContext.mScreenFactor * startOffset), gContext.mViewProjection)
+                local axisEndOnScreen = worldToPos(modelPos + dirAxis * (gContext.mScreenFactor * endOffset), gContext.mViewProjection)
+
+                local posV = makeVect(posOnPlanScreen.x, posOnPlanScreen.y)
+                local closestPointOnAxis = PointOnSegment(posV, makeVect(axisStartOnScreen.x, axisStartOnScreen.y), makeVect(axisEndOnScreen.x, axisEndOnScreen.y))
+
+                if (closestPointOnAxis - posV):Length() < 12 then -- pixel size
+                    if not isAxisMasked then
+                        type = MT_SCALE_X + i
+                    end
+                end
+            end
+            i += 1
+        end
+
+        -- universal
+
+        local deltaScreen = makeVect(io.MousePos.x - gContext.mScreenSquareCenter.x, io.MousePos.y - gContext.mScreenSquareCenter.y, 0, 0)
+        local dist = deltaScreen:Length()
+        if Contains(op, OPERATION.SCALEU) and dist >= 17 and dist < 23 then
+            type = MT_SCALE_XYZ
+        end
+
+        i = 0
+        while i < 3 and type == MT_NONE do
+            if Intersects(op, lshift(OPERATION.SCALE_XU, i)) then
+                local dirAxis, _dirPlaneX, _dirPlaneY, belowAxisLimit = ComputeTripodAxisAndVisibility(i, true)
+
+                -- draw axis
+                if belowAxisLimit then
+                    local markerScale = 1.0
+                    if Contains(op, lshift(OPERATION.TRANSLATE_X, i)) then markerScale = 1.4 end
+                    local worldDirSSpace = worldToPos(dirAxis * (markerScale * gContext.mScreenFactor), gContext.mMVPLocal)
+
+                    local d = worldDirSSpace - io.MousePos
+                    local distance = sqrt(d.x * d.x + d.y * d.y)
+                    if distance < 12 then
+                        type = MT_SCALE_X + i
+                    end
+                end
+            end
+            i += 1
+        end
+        return type
+    end
+
+    function GetRotateType(op)
+        if gContext.mbUsing then
+            return MT_NONE
+        end
+
+        local isNoAxesMasked = gContext.mAxisMask == 0
+        local isMultipleAxesMasked = band(gContext.mAxisMask, gContext.mAxisMask - 1) ~= 0
+
+        local io = ImGui.GetIO()
+        local type = MT_NONE
+
+        local deltaScreen = makeVect(io.MousePos.x - gContext.mScreenSquareCenter.x, io.MousePos.y - gContext.mScreenSquareCenter.y, 0, 0)
+        local dist = deltaScreen:Length()
+        if Intersects(op, OPERATION.ROTATE_SCREEN) and dist >= (gContext.mRadiusSquareCenter - 4) and dist < (gContext.mRadiusSquareCenter + 4) then
+            if not isNoAxesMasked then
+                return MT_NONE
+            end
+            type = MT_ROTATE_SCREEN
+        end
+
+        local m = gContext.mModel
+        local planNormals = { [0] = m:GetRow(0), m:GetRow(1), m:GetRow(2) }
+        local modelPos = m:GetRow(3)
+
+        local modelViewPos = makeVect(0, 0)
+        modelViewPos:TransformPoint(modelPos, gContext.mViewMat)
+
+        local i = 0
+        while i < 3 and type == MT_NONE do
+            if Intersects(op, lshift(OPERATION.ROTATE_X, i)) then
+                local isAxisMasked = band(lshift(1, i), gContext.mAxisMask) ~= 0
+                -- pickup plan
+                local pickupPlan = BuildPlan(modelPos, planNormals[i])
+
+                local len = IntersectRayPlane(gContext.mRayOrigin, gContext.mRayVector, pickupPlan)
+                local intersectWorldPos = gContext.mRayOrigin + gContext.mRayVector * len
+                local intersectViewPos = makeVect(0, 0)
+                intersectViewPos:TransformPoint(intersectWorldPos, gContext.mViewMat)
+
+                if not (abs(modelViewPos.z) - abs(intersectViewPos.z) < -FLT_EPSILON) then
+                    local localPos = intersectWorldPos - modelPos
+                    local idealPosOnCircle = Normalized(localPos)
+                    idealPosOnCircle:TransformVector(gContext.mModelInverse)
+                    local idealPosOnCircleScreen = worldToPos(idealPosOnCircle * (rotationDisplayFactor * gContext.mScreenFactor), gContext.mMVP)
+
+                    local distanceOnScreen = idealPosOnCircleScreen - io.MousePos
+
+                    local distance = makeVect(distanceOnScreen.x, distanceOnScreen.y):Length()
+                    if distance < 8 then -- pixel size
+                        if (not isAxisMasked or isMultipleAxesMasked) and not isNoAxesMasked then
+                            break
+                        end
+                        type = MT_ROTATE_X + i
+                    end
+                end
+            end
+            i += 1
+        end
+
+        return type
+    end
 
     -- [Port] gizmoHitProportion: returns type, hitProportion instead of writing through a pointer
     function GetMoveType(op, wantHitProportion)
@@ -1429,8 +2095,206 @@ return function(G)
         return modified, type
     end
 
-    local function HandleScale(matrix, deltaMatrix, op, type, snap) return false, type end -- [Port] TODO
-    local function HandleRotation(matrix, deltaMatrix, op, type, snap) return false, type end -- [Port] TODO
+    -- [Port] returns modified, type (C++ MOVETYPE& type)
+    local function HandleScale(matrix, deltaMatrix, op, type, snap)
+        if (not Intersects(op, OPERATION.SCALE) and not Intersects(op, OPERATION.SCALEU)) or type ~= MT_NONE or not gContext.mbMouseOver then
+            return false, type
+        end
+        local io = ImGui.GetIO()
+        local modified = false
+        local ml = gContext.mModelLocal
+
+        if not gContext.mbUsing then
+            -- find new possible way to scale
+            if gContext.mbOverGizmoHotspot then
+                type = MT_NONE
+            else
+                type = GetScaleType(op)
+            end
+            gContext.mbOverGizmoHotspot = gContext.mbOverGizmoHotspot or type ~= MT_NONE
+
+            if type ~= MT_NONE then
+                ImGui.SetNextFrameWantCaptureMouse(true)
+            end
+            if CanActivate() and type ~= MT_NONE then
+                CopyTripodState(gContext.mActiveTripodState, gContext.mTripodState)
+                gContext.mbUsing = true
+                gContext.mEditingID = GetCurrentID()
+                gContext.mCurrentHandleType = type
+                local movePlanNormal = { ml:GetRow(1), ml:GetRow(2), ml:GetRow(0), ml:GetRow(2), ml:GetRow(1), ml:GetRow(0), -gContext.mCameraDir }
+                -- pickup plan
+
+                gContext.mTranslationPlan = BuildPlan(ml:GetRow(3), movePlanNormal[type - MT_SCALE_X + 1])
+                local len = IntersectRayPlane(gContext.mRayOrigin, gContext.mRayVector, gContext.mTranslationPlan)
+                gContext.mTranslationPlanOrigin = gContext.mRayOrigin + gContext.mRayVector * len
+                gContext.mMatrixOrigin = ml:GetRow(3)
+                gContext.mScale:Set(1, 1, 1)
+                gContext.mRelativeOrigin = (gContext.mTranslationPlanOrigin - ml:GetRow(3)) * (1 / gContext.mScreenFactor)
+                local ms = gContext.mModelSource
+                gContext.mScaleValueOrigin = makeVect(ms:GetRow(0):Length(), ms:GetRow(1):Length(), ms:GetRow(2):Length())
+                gContext.mSaveMousePosx = io.MousePos.x
+            end
+        end
+        -- scale
+        if gContext.mbUsing and (GetCurrentID() == gContext.mEditingID) and IsScaleType(gContext.mCurrentHandleType) then
+            ImGui.SetNextFrameWantCaptureMouse(true)
+            local len = IntersectRayPlane(gContext.mRayOrigin, gContext.mRayVector, gContext.mTranslationPlan)
+            local newPos = gContext.mRayOrigin + gContext.mRayVector * len
+            local newOrigin = newPos - gContext.mRelativeOrigin * gContext.mScreenFactor
+            local delta = newOrigin - ml:GetRow(3)
+
+            -- 1 axis constraint
+            if gContext.mCurrentHandleType >= MT_SCALE_X and gContext.mCurrentHandleType <= MT_SCALE_X + 2 then
+                local axisIndex = gContext.mCurrentHandleType - MT_SCALE_X
+                local axisValue = ml:GetRow(axisIndex)
+                local lengthOnAxis = Dot(axisValue, delta)
+                delta = axisValue * lengthOnAxis
+
+                local baseVector = gContext.mTranslationPlanOrigin - ml:GetRow(3)
+                local ratio = Dot(axisValue, baseVector + delta) / Dot(axisValue, baseVector)
+
+                vecSetComp(gContext.mScale, axisIndex, math.max(ratio, 0.001))
+            else
+                local scaleDelta = (io.MousePos.x - gContext.mSaveMousePosx) * 0.01
+                gContext.mScale:Set(math.max(1 + scaleDelta, 0.001))
+            end
+
+            -- snap
+            if snap then
+                local scaleSnap = { snap[1], snap[1], snap[1] }
+                ComputeSnapV(gContext.mScale, scaleSnap)
+            end
+
+            -- no 0 allowed
+            for i = 0, 2 do
+                vecSetComp(gContext.mScale, i, math.max(vecComp(gContext.mScale, i), 0.001))
+            end
+
+            local s, last = gContext.mScale, gContext.mScaleLast
+            if s.x ~= last.x or s.y ~= last.y or s.z ~= last.z or s.w ~= last.w then
+                modified = true
+            end
+            gContext.mScaleLast = s:Copy()
+
+            -- compute matrix & delta
+            local deltaMatrixScale = matrix_t.new()
+            deltaMatrixScale:Scale(gContext.mScale * gContext.mScaleValueOrigin)
+
+            local res = deltaMatrixScale * ml
+            for k = 1, 16 do matrix[k] = res[k] end -- [Port] write into caller's array in place
+
+            if deltaMatrix then
+                local deltaScale = gContext.mScale * gContext.mScaleValueOrigin
+
+                local originalScaleDivider = makeVect(1 / gContext.mModelScaleOrigin.x, 1 / gContext.mModelScaleOrigin.y, 1 / gContext.mModelScaleOrigin.z)
+
+                deltaScale = deltaScale * originalScaleDivider
+
+                deltaMatrixScale:Scale(deltaScale)
+                for k = 1, 16 do deltaMatrix[k] = deltaMatrixScale[k] end
+            end
+
+            if not ImGui.IsMouseDown(0) then -- [Port] io.MouseDown[0]
+                gContext.mbUsing = false
+                gContext.mScale:Set(1, 1, 1)
+            end
+
+            type = gContext.mCurrentHandleType
+        end
+        return modified, type
+    end
+
+    -- [Port] returns modified, type (C++ MOVETYPE& type)
+    local function HandleRotation(matrix, deltaMatrix, op, type, snap)
+        if not Intersects(op, OPERATION.ROTATE) or type ~= MT_NONE or not gContext.mbMouseOver then
+            return false, type
+        end
+        local applyRotationLocaly = gContext.mMode == ImGuizmo.MODE.LOCAL
+        local modified = false
+
+        if not gContext.mbUsing then
+            if gContext.mbOverGizmoHotspot then
+                type = MT_NONE
+            else
+                type = GetRotateType(op)
+            end
+            gContext.mbOverGizmoHotspot = gContext.mbOverGizmoHotspot or type ~= MT_NONE
+
+            if type ~= MT_NONE then
+                ImGui.SetNextFrameWantCaptureMouse(true)
+            end
+
+            if type == MT_ROTATE_SCREEN then
+                applyRotationLocaly = true
+            end
+
+            if CanActivate() and type ~= MT_NONE then
+                gContext.mbUsing = true
+                gContext.mEditingID = GetCurrentID()
+                gContext.mCurrentHandleType = type
+                local m = gContext.mModel
+                local rotatePlanNormal = { m:GetRow(0), m:GetRow(1), m:GetRow(2), -gContext.mCameraDir }
+                -- pickup plan
+                if applyRotationLocaly then
+                    gContext.mTranslationPlan = BuildPlan(m:GetRow(3), rotatePlanNormal[type - MT_ROTATE_X + 1])
+                else
+                    gContext.mTranslationPlan = BuildPlan(gContext.mModelSource:GetRow(3), directionUnaryV[type - MT_ROTATE_X])
+                end
+
+                local len = IntersectRayPlane(gContext.mRayOrigin, gContext.mRayVector, gContext.mTranslationPlan)
+                local localPos = gContext.mRayOrigin + gContext.mRayVector * len - m:GetRow(3)
+                gContext.mRotationVectorSource = Normalized(localPos)
+                gContext.mRotationAngleOrigin = ComputeAngleOnPlan()
+            end
+        end
+
+        -- rotation
+        if gContext.mbUsing and (GetCurrentID() == gContext.mEditingID) and IsRotateType(gContext.mCurrentHandleType) then
+            ImGui.SetNextFrameWantCaptureMouse(true)
+            gContext.mRotationAngle = ComputeAngleOnPlan()
+            if snap then
+                local snapInRadian = snap[1] * DEG2RAD
+                gContext.mRotationAngle = ComputeSnap(gContext.mRotationAngle, snapInRadian)
+            end
+            local tp = gContext.mTranslationPlan
+            local rotationAxisLocalSpace = makeVect(0, 0)
+            rotationAxisLocalSpace:TransformVector(makeVect(tp.x, tp.y, tp.z, 0), gContext.mModelInverse)
+            rotationAxisLocalSpace:Normalize()
+
+            local deltaRotation = matrix_t.new()
+            deltaRotation:RotationAxis(rotationAxisLocalSpace, gContext.mRotationAngle - gContext.mRotationAngleOrigin)
+            if gContext.mRotationAngle ~= gContext.mRotationAngleOrigin then
+                modified = true
+            end
+            gContext.mRotationAngleOrigin = gContext.mRotationAngle
+
+            local scaleOrigin = matrix_t.new()
+            scaleOrigin:Scale(gContext.mModelScaleOrigin)
+
+            local res
+            if applyRotationLocaly then
+                res = scaleOrigin * deltaRotation * gContext.mModelLocal
+            else
+                local src = matrix_t.new(gContext.mModelSource)
+                src:SetRow(3, 0, 0, 0, 0) -- [Port] v.position.Set(0.f) zeroes w too, as upstream
+                res = src * deltaRotation
+                res:SetRow(3, gContext.mModelSource[13], gContext.mModelSource[14], gContext.mModelSource[15], gContext.mModelSource[16])
+            end
+            for k = 1, 16 do matrix[k] = res[k] end -- [Port] write into caller's array in place
+
+            if deltaMatrix then
+                local d = gContext.mModelInverse * deltaRotation * gContext.mModel
+                for k = 1, 16 do deltaMatrix[k] = d[k] end
+            end
+
+            if not ImGui.IsMouseDown(0) then -- [Port] io.MouseDown[0]
+                gContext.mbUsing = false
+                gContext.mEditingID = -1
+            end
+            type = gContext.mCurrentHandleType
+        end
+        return modified, type
+    end
 
     function ImGuizmo.SetAlternativeWindow(window)
         gContext.mAlternativeWindow = window
@@ -1501,7 +2365,8 @@ return function(G)
 
         -- set delta to identity
         if deltaMatrix then
-            matrix_t.SetToIdentity(deltaMatrix)
+            for k = 1, 16 do deltaMatrix[k] = 0 end -- [Port] caller's plain array has no matrix_t methods
+            deltaMatrix[1], deltaMatrix[6], deltaMatrix[11], deltaMatrix[16] = 1, 1, 1, 1
         end
 
         -- behind camera
