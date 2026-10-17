@@ -24,6 +24,7 @@ do
 	local Frames = 0
 	Run.RenderStepped:Connect(function()
 		Frames += 1
-		if Frames == 30 then -- last frame (--frames 30): 29 example frames ran clean print("OK") end
+		-- last frame of --frames 30: the 29 example frames before it ran clean
+		if Frames == 30 then print("OK") end
 	end)
 end
