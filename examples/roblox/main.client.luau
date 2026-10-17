@@ -2,7 +2,7 @@ local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local G = require(RS:WaitForChild("ImGui"))
 local ImGuizmo = require(RS:WaitForChild("ImGuizmo"))(G)
-local ImGui, ImVec2 = G.ImGui, G.ImVec2
+local ImGui, ImVec2, ImGuiKey = G.ImGui, G.ImVec2, G.ImGuiKey
 local OP, MODE, Roblox = ImGuizmo.OPERATION, ImGuizmo.MODE, ImGuizmo.Roblox
 
 local Part = workspace:FindFirstChild("GizmoPart")
@@ -16,25 +16,80 @@ if not Part then
 end
 
 local Operation, Mode = OP.TRANSLATE, MODE.WORLD
+local UseSnap, ShowGrid = false, true
+local Snap = { 1, 1, 1 } -- translation xyz; [1] doubles as angle / scale snap
+local AngleSnap, ScaleSnap = 15, 0.1
+local BoundSizing, BoundSizingSnap = false, false
+-- Part.Size is baked into the matrix, so the unit box hugs the part
+local Bounds = { -0.5, -0.5, -0.5, 0.5, 0.5, 0.5 }
+local BoundsSnap = { 0.1, 0.1, 0.1 }
+local Identity = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 }
 local Camera = workspace.CurrentCamera
 
-ImGui.CreateContext()
-G.ImGui_ImplRoblox.Init(game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui"))
-RunService.RenderStepped:Connect(function()
-	G.ImGui_ImplRoblox.NewFrame()
-	ImGui.NewFrame()
-	ImGuizmo.BeginFrame()
-
-	ImGui.Begin("Gizmo")
+local function EditTransform(Matrix)
+	if ImGui.IsKeyPressed(ImGuiKey.T) then Operation = OP.TRANSLATE end
+	if ImGui.IsKeyPressed(ImGuiKey.E) then Operation = OP.ROTATE end
+	if ImGui.IsKeyPressed(ImGuiKey.R) then Operation = OP.SCALE end
 	_, Operation = ImGui.RadioButton("Translate", Operation, OP.TRANSLATE)
 	ImGui.SameLine()
 	_, Operation = ImGui.RadioButton("Rotate", Operation, OP.ROTATE)
 	ImGui.SameLine()
 	_, Operation = ImGui.RadioButton("Scale", Operation, OP.SCALE)
-	_, Mode = ImGui.RadioButton("Local", Mode, MODE.LOCAL)
 	ImGui.SameLine()
-	_, Mode = ImGui.RadioButton("World", Mode, MODE.WORLD)
-	ImGui.End()
+	_, Operation = ImGui.RadioButton("Universal", Operation, OP.UNIVERSAL)
+
+	local Tr, Rt, Sc = {}, {}, {}
+	ImGuizmo.DecomposeMatrixToComponents(Matrix, Tr, Rt, Sc)
+	local Edited = ImGui.InputFloat3("Tr", Tr)
+	Edited = ImGui.InputFloat3("Rt", Rt) or Edited
+	Edited = ImGui.InputFloat3("Sc", Sc) or Edited
+	if Edited then ImGuizmo.RecomposeMatrixFromComponents(Tr, Rt, Sc, Matrix) end
+
+	if Operation ~= OP.SCALE then
+		_, Mode = ImGui.RadioButton("Local", Mode, MODE.LOCAL)
+		ImGui.SameLine()
+		_, Mode = ImGui.RadioButton("World", Mode, MODE.WORLD)
+	end
+
+	_, UseSnap = ImGui.Checkbox("Snap", UseSnap)
+	ImGui.SameLine()
+	if Operation == OP.ROTATE then
+		_, AngleSnap = ImGui.InputFloat("Angle Snap", AngleSnap)
+	elseif Operation == OP.SCALE then
+		_, ScaleSnap = ImGui.InputFloat("Scale Snap", ScaleSnap)
+	else
+		ImGui.InputFloat3("Snap Value", Snap)
+	end
+
+	_, BoundSizing = ImGui.Checkbox("Bound Sizing", BoundSizing)
+	if BoundSizing then
+		ImGui.PushID(3)
+		_, BoundSizingSnap = ImGui.Checkbox("Bound Snap", BoundSizingSnap)
+		ImGui.SameLine()
+		ImGui.InputFloat3("Snap", BoundsSnap)
+		ImGui.PopID()
+	end
+	_, ShowGrid = ImGui.Checkbox("Show Grid", ShowGrid)
+
+	local SnapArg = nil
+	if UseSnap then
+		if Operation == OP.ROTATE then
+			SnapArg = { AngleSnap, AngleSnap, AngleSnap }
+		elseif Operation == OP.SCALE then
+			SnapArg = { ScaleSnap, ScaleSnap, ScaleSnap }
+		else
+			SnapArg = Snap
+		end
+	end
+	return Edited, SnapArg
+end
+
+ImGui.CreateContext()
+G.ImGui_ImplRoblox.Init()
+RunService.RenderStepped:Connect(function()
+	G.ImGui_ImplRoblox.NewFrame()
+	ImGui.NewFrame()
+	ImGuizmo.BeginFrame()
 
 	local Viewport = Camera.ViewportSize
 	ImGuizmo.SetDrawlist(ImGui.GetForegroundDrawList())
@@ -43,7 +98,7 @@ RunService.RenderStepped:Connect(function()
 	local View = Roblox.ViewFromCamera(Camera)
 	local Proj = Roblox.ProjFromCamera(Camera)
 
-	-- Part.Size is baked into the basis so SCALE edits it
+	-- Part.Size is baked into the basis so SCALE / bounds edit it
 	local Matrix = Roblox.MatrixFromCFrame(Part.CFrame)
 	local Size = Part.Size
 	for I = 1, 3 do
@@ -51,7 +106,15 @@ RunService.RenderStepped:Connect(function()
 		Matrix[4 + I] *= Size.Y
 		Matrix[8 + I] *= Size.Z
 	end
-	if ImGuizmo.Manipulate(View, Proj, Operation, Mode, Matrix) then
+
+	ImGui.Begin("Editor")
+	local Edited, SnapArg = EditTransform(Matrix)
+	ImGui.End()
+
+	if ShowGrid then ImGuizmo.DrawGrid(View, Proj, Identity, 100) end
+	local Moved = ImGuizmo.Manipulate(View, Proj, Operation, Mode, Matrix, nil, SnapArg,
+		BoundSizing and Bounds or nil, BoundSizing and BoundSizingSnap and BoundsSnap or nil)
+	if Edited or Moved then
 		local NewCFrame, NewSize = Roblox.CFrameFromMatrix(Matrix)
 		Part.CFrame = NewCFrame
 		Part.Size = NewSize
