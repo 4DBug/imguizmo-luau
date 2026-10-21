@@ -41,6 +41,7 @@ return function(G)
     -- utility and math
 
     -- [Port] float* arrays are 1-based Luau arrays: upstream a[i] is a[i + 1]
+    @native
     local function FPU_MatrixF_x_MatrixF(a, b, r)
         for row = 0, 3 do
             local o = row * 4
@@ -84,16 +85,19 @@ return function(G)
         Frustum(-xmax, xmax, -ymax, ymax, znear, zfar, m16, rightHanded)
     end
 
+    @native
     local function Cross3(a, b, r) -- [Port] upstream float* overload of Cross
         r[1] = a[2] * b[3] - a[3] * b[2]
         r[2] = a[3] * b[1] - a[1] * b[3]
         r[3] = a[1] * b[2] - a[2] * b[1]
     end
 
+    @native
     local function Dot3(a, b) -- [Port] upstream float* overload of Dot
         return a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
     end
 
+    @native
     local function Normalize3(a, r) -- [Port] upstream float* overload of Normalize
         local il = 1 / (sqrt(Dot3(a, a)) + FLT_EPSILON)
         r[1] = a[1] * il
@@ -146,11 +150,13 @@ return function(G)
     local vec_t = {}
     vec_t.__index = vec_t
 
+    @native
     local function makeVect(_x, _y, _z, _w)
         return setmetatable({ x = _x, y = _y, z = _z or 0, w = _w or 0 }, vec_t)
     end
     vec_t.new = makeVect
 
+    @native
     function vec_t:Lerp(v, t)
         self.x += (v.x - self.x) * t
         self.y += (v.y - self.y) * t
@@ -158,6 +164,7 @@ return function(G)
         self.w += (v.w - self.w) * t
     end
 
+    @native
     function vec_t:Set(_x, _y, _z, _w)
         if _y == nil then
             self.x, self.y, self.z, self.w = _x, _x, _x, _x
@@ -166,19 +173,28 @@ return function(G)
         end
     end
 
+    @native
     function vec_t:Copy() return makeVect(self.x, self.y, self.z, self.w) end -- [Port] C++ value copy
+    @native
     function vec_t:MulScalar(v) self.x *= v; self.y *= v; self.z *= v; self.w *= v; return self end -- [Port] operator *= (float)
 
-    vec_t.__mul = function(a, b)
+    @native
+    function vec_t.__mul(a, b)
         if type(b) == "number" then return makeVect(a.x * b, a.y * b, a.z * b, a.w * b) end
         return makeVect(a.x * b.x, a.y * b.y, a.z * b.z, a.w * b.w)
     end
-    vec_t.__unm = function(a) return makeVect(-a.x, -a.y, -a.z, -a.w) end
-    vec_t.__sub = function(a, b) return makeVect(a.x - b.x, a.y - b.y, a.z - b.z, a.w - b.w) end
-    vec_t.__add = function(a, b) return makeVect(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w) end
+    @native
+    function vec_t.__unm(a) return makeVect(-a.x, -a.y, -a.z, -a.w) end
+    @native
+    function vec_t.__sub(a, b) return makeVect(a.x - b.x, a.y - b.y, a.z - b.z, a.w - b.w) end
+    @native
+    function vec_t.__add(a, b) return makeVect(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w) end
 
+    @native
     function vec_t:Length() return sqrt(self.x * self.x + self.y * self.y + self.z * self.z) end
+    @native
     function vec_t:LengthSq() return (self.x * self.x + self.y * self.y + self.z * self.z) end
+    @native
     function vec_t:Normalize(v)
         if v then self:Set(v.x, v.y, v.z, v.w) end
         local l = self:Length()
@@ -186,8 +202,10 @@ return function(G)
         self:MulScalar(1 / l)
         return self:Copy()
     end
+    @native
     function vec_t:Abs() return makeVect(abs(self.x), abs(self.y), abs(self.z)) end
 
+    @native
     function vec_t:Cross(v1, v2)
         if v2 == nil then v1, v2 = self:Copy(), v1 end
         local x = v1.y * v2.z - v1.z * v2.y
@@ -196,10 +214,13 @@ return function(G)
         self.x, self.y, self.z, self.w = x, y, z, 0
     end
 
+    @native
     function vec_t:Dot(v) return (self.x * v.x) + (self.y * v.y) + (self.z * v.z) + (self.w * v.w) end
+    @native
     function vec_t:Dot3(v) return (self.x * v.x) + (self.y * v.y) + (self.z * v.z) end
 
     -- [Port] m.m[l][c] == m[l * 4 + c + 1]
+    @native
     function vec_t:Transform(s, matrix)
         if matrix == nil then matrix = s else self:Set(s.x, s.y, s.z, s.w) end
         local m = matrix
@@ -210,6 +231,7 @@ return function(G)
         self.w = x * m[4] + y * m[8] + z * m[12] + w * m[16]
     end
 
+    @native
     function vec_t:TransformPoint(v, matrix)
         if matrix == nil then matrix = v else self:Set(v.x, v.y, v.z, v.w) end
         local m = matrix
@@ -220,6 +242,7 @@ return function(G)
         self.w = x * m[4] + y * m[8] + z * m[12] + m[16]
     end
 
+    @native
     function vec_t:TransformVector(v, matrix)
         if matrix == nil then matrix = v else self:Set(v.x, v.y, v.z, v.w) end
         local m = matrix
@@ -230,10 +253,14 @@ return function(G)
         self.w = x * m[4] + y * m[8] + z * m[12]
     end
 
+    @native
     local function Normalized(v) local res = v:Copy(); res:Normalize(); return res end
+    @native
     local function Cross(v1, v2) local res = makeVect(0, 0); res:Cross(v1, v2); return res end
+    @native
     local function Dot(v1, v2) return (v1.x * v2.x) + (v1.y * v2.y) + (v1.z * v2.z) end
 
+    @native
     local function BuildPlan(p_point1, p_normal)
         local normal = makeVect(0, 0)
         normal:Normalize(p_normal)
@@ -246,21 +273,25 @@ return function(G)
     local matrix_t = {}
     matrix_t.__index = matrix_t
 
+    @native
     function matrix_t.new(src)
         local m = setmetatable({}, matrix_t)
         for i = 1, 16 do m[i] = (src and src[i]) or 0 end
         return m
     end
 
+    @native
     function matrix_t:GetRow(r) -- [Port] r: 0 right, 1 up, 2 dir, 3 position
         local o = r * 4
         return makeVect(self[o + 1], self[o + 2], self[o + 3], self[o + 4])
     end
+    @native
     function matrix_t:SetRow(r, x, y, z, w)
         local o = r * 4
         self[o + 1], self[o + 2], self[o + 3], self[o + 4] = x, y, z, w
     end
 
+    @native
     function matrix_t:Translation(_x, _y, _z)
         if type(_x) == "table" then _x, _y, _z = _x.x, _x.y, _x.z end
         self:SetRow(0, 1, 0, 0, 0)
@@ -269,6 +300,7 @@ return function(G)
         self:SetRow(3, _x, _y, _z, 1)
     end
 
+    @native
     function matrix_t:Scale(_x, _y, _z)
         if type(_x) == "table" then _x, _y, _z = _x.x, _x.y, _x.z end
         self:SetRow(0, _x, 0, 0, 0)
@@ -277,23 +309,27 @@ return function(G)
         self:SetRow(3, 0, 0, 0, 1)
     end
 
-    matrix_t.__mul = function(a, b)
+    @native
+    function matrix_t.__mul(a, b)
         local matT = matrix_t.new()
         matT:Multiply(a, b)
         return matT
     end
 
+    @native
     function matrix_t:Multiply(m1, m2)
         if m2 == nil then m1, m2 = matrix_t.new(self), m1 end
         FPU_MatrixF_x_MatrixF(m1, m2, self)
     end
 
+    @native
     function matrix_t:GetDeterminant()
         local m = self
         return m[1] * m[6] * m[11] + m[2] * m[7] * m[9] + m[3] * m[5] * m[10] -
             m[3] * m[6] * m[9] - m[2] * m[5] * m[11] - m[1] * m[7] * m[10]
     end
 
+    @native
     function matrix_t:SetToIdentity()
         self:SetRow(0, 1, 0, 0, 0)
         self:SetRow(1, 0, 1, 0, 0)
@@ -301,6 +337,7 @@ return function(G)
         self:SetRow(3, 0, 0, 0, 1)
     end
 
+    @native
     function matrix_t:Transpose()
         local tmpm = matrix_t.new(self)
         for l = 0, 3 do
@@ -310,6 +347,7 @@ return function(G)
         end
     end
 
+    @native
     function matrix_t:OrthoNormalize()
         for r = 0, 2 do
             local v = self:GetRow(r)
@@ -318,6 +356,7 @@ return function(G)
         end
     end
 
+    @native
     function matrix_t:Inverse(srcMatrix, affine)
         local det = 0
         local m16 = self
@@ -416,6 +455,7 @@ return function(G)
         return det
     end
 
+    @native
     function matrix_t:RotationAxis(axis, angle)
         local length2 = axis:LengthSq()
         if length2 < FLT_EPSILON then
@@ -496,6 +536,7 @@ return function(G)
     local band, lshift = bit32.band, bit32.lshift
     local FLT_MAX = 3.402823466e+38
 
+    @native
     local function Intersects(lhs, rhs) return band(lhs, rhs) ~= 0 end
     local function Contains(lhs, rhs) return band(lhs, rhs) == rhs end
     local function IsWithin(x, y, z) return (x >= y) and (x <= z) end
@@ -738,6 +779,7 @@ return function(G)
         return ImGui.ColorConvertFloat4ToU32(gContext.mStyle.Colors[idx])
     end
 
+    @native
     local function worldToPos(worldPos, mat, position, size)
         if position == nil then position = ImVec2(gContext.mX, gContext.mY) end
         if size == nil then size = ImVec2(gContext.mWidth, gContext.mHeight) end
@@ -888,6 +930,7 @@ return function(G)
         return -(numer / denom)
     end
 
+    @native
     local function DistanceToPlane(point, plan)
         return plan:Dot3(point) + plan.w
     end
@@ -2583,6 +2626,7 @@ return function(G)
     end
 
     -- [Port] clips ptA/ptB against the frustum in place; returns visible (shared by DrawGrid/DrawGridCustomColor)
+    @native
     local function ClipGridLine(frustum, ptA, ptB)
         for i = 1, 6 do
             local dA = DistanceToPlane(ptA, frustum[i])
@@ -2606,6 +2650,7 @@ return function(G)
         return true
     end
 
+    @native
     local function GridLine(dir, f, gridSize)
         if dir == 1 then
             return makeVect(-gridSize, 0, f), makeVect(gridSize, 0, f)

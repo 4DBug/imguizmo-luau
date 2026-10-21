@@ -43,6 +43,7 @@ return function(G)
     -- utility and math
 
     -- [Port] float* arrays are 1-based Luau arrays: upstream a[i] is a[i + 1]
+
     local function FPU_MatrixF_x_MatrixF(a, b, r)
         for row = 0, 3 do
             local o = row * 4
@@ -169,18 +170,24 @@ return function(G)
     end
 
     function vec_t:Copy() return makeVect(self.x, self.y, self.z, self.w) end -- [Port] C++ value copy
+
     function vec_t:MulScalar(v) self.x =self.x* v; self.y =self.y* v; self.z =self.z* v; self.w =self.w* v; return self end -- [Port] operator *= (float)
 
-    vec_t.__mul = function(a, b)
+    function vec_t.__mul(a, b)
         if type(b) == "number" then return makeVect(a.x * b, a.y * b, a.z * b, a.w * b) end
         return makeVect(a.x * b.x, a.y * b.y, a.z * b.z, a.w * b.w)
     end
-    vec_t.__unm = function(a) return makeVect(-a.x, -a.y, -a.z, -a.w) end
-    vec_t.__sub = function(a, b) return makeVect(a.x - b.x, a.y - b.y, a.z - b.z, a.w - b.w) end
-    vec_t.__add = function(a, b) return makeVect(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w) end
+
+    function vec_t.__unm(a) return makeVect(-a.x, -a.y, -a.z, -a.w) end
+
+    function vec_t.__sub(a, b) return makeVect(a.x - b.x, a.y - b.y, a.z - b.z, a.w - b.w) end
+
+    function vec_t.__add(a, b) return makeVect(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w) end
 
     function vec_t:Length() return sqrt(self.x * self.x + self.y * self.y + self.z * self.z) end
+
     function vec_t:LengthSq() return (self.x * self.x + self.y * self.y + self.z * self.z) end
+
     function vec_t:Normalize(v)
         if v then self:Set(v.x, v.y, v.z, v.w) end
         local l = self:Length()
@@ -188,6 +195,7 @@ return function(G)
         self:MulScalar(1 / l)
         return self:Copy()
     end
+
     function vec_t:Abs() return makeVect(abs(self.x), abs(self.y), abs(self.z)) end
 
     function vec_t:Cross(v1, v2)
@@ -199,9 +207,11 @@ return function(G)
     end
 
     function vec_t:Dot(v) return (self.x * v.x) + (self.y * v.y) + (self.z * v.z) + (self.w * v.w) end
+
     function vec_t:Dot3(v) return (self.x * v.x) + (self.y * v.y) + (self.z * v.z) end
 
     -- [Port] m.m[l][c] == m[l * 4 + c + 1]
+
     function vec_t:Transform(s, matrix)
         if matrix == nil then matrix = s else self:Set(s.x, s.y, s.z, s.w) end
         local m = matrix
@@ -233,7 +243,9 @@ return function(G)
     end
 
     local function Normalized(v) local res = v:Copy(); res:Normalize(); return res end
+
     local function Cross(v1, v2) local res = makeVect(0, 0); res:Cross(v1, v2); return res end
+
     local function Dot(v1, v2) return (v1.x * v2.x) + (v1.y * v2.y) + (v1.z * v2.z) end
 
     local function BuildPlan(p_point1, p_normal)
@@ -258,6 +270,7 @@ return function(G)
         local o = r * 4
         return makeVect(self[o + 1], self[o + 2], self[o + 3], self[o + 4])
     end
+
     function matrix_t:SetRow(r, x, y, z, w)
         local o = r * 4
         self[o + 1], self[o + 2], self[o + 3], self[o + 4] = x, y, z, w
@@ -279,7 +292,7 @@ return function(G)
         self:SetRow(3, 0, 0, 0, 1)
     end
 
-    matrix_t.__mul = function(a, b)
+    function matrix_t.__mul(a, b)
         local matT = matrix_t.new()
         matT:Multiply(a, b)
         return matT
@@ -2585,6 +2598,7 @@ end            end
     end
 
     -- [Port] clips ptA/ptB against the frustum in place; returns visible (shared by DrawGrid/DrawGridCustomColor)
+
     local function ClipGridLine(frustum, ptA, ptB)
         for i = 1, 6 do
             local dA = DistanceToPlane(ptA, frustum[i])
